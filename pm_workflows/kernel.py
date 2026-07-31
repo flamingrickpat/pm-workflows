@@ -208,6 +208,12 @@ class Kernel:
         if resume and prior:
             print(f"RESUME: last accepted revision {prior[:8]}")
             if head != prior:
+                resume_phase = self._resume_point(announce=False)
+                if self._candidate_is_pending_followup(
+                    resume_phase, head, accepted_revision=prior
+                ):
+                    print(f"  HEAD is candidate {head[:8]} — preserving for follow-up")
+                    return prior
                 print(f"  HEAD is {head[:8]} — reverting to the accepted revision")
                 self.checkpoint.restore(prior)
             elif self.checkpoint.is_dirty() and self._resume_discards_worktree():
@@ -831,16 +837,44 @@ class Kernel:
         """
         if self.checkpoint is None or not self.checkpoint.is_dirty():
             return
+        head_before_settle = self.checkpoint.current_rev()
+        preserve_candidate = self._candidate_is_pending_followup(
+            phase, head_before_settle
+        )
         ref = f"leftover/{self.task_id}/{phase.name}"
         parked = self.checkpoint.park(ref)
         print(f"    leftover changes parked on {ref} ({parked[:8]}) and cleared")
         if self.accepted_revision:
-            self.checkpoint.restore(self.accepted_revision)
+            self.checkpoint.restore(
+                head_before_settle if preserve_candidate else self.accepted_revision
+            )
         self.journal.append(JournalEntry(
             run_id=self.run_id, phase=phase.name, kind="leftover", ok=True,
             verdict="parked", candidate_rev=parked, item=self.current_item,
-            reason_codes=[ref],
+            reason_codes=[ref] + (["preserved_candidate"] if preserve_candidate else []),
         ))
+
+    def _candidate_is_pending_followup(
+        self,
+        phase: PhaseConfig | None,
+        head: str,
+        accepted_revision: str | None = None,
+    ) -> bool:
+        """Keep a committed candidate visible to the role that validates it.
+
+        A successful implementation can be followed by several gates before a
+        reviewer checkpoint accepts it. If that implementation also left
+        untracked inspection material behind, settle it without resetting the
+        committed candidate that the reviewer must inspect.
+        """
+        accepted = accepted_revision or getattr(self, "accepted_revision", None)
+        if phase is None or not accepted or head == accepted:
+            return False
+        route = self.journal.last_route()
+        if not route or route.get("verdict") != phase.name:
+            return False
+        preceding = self.manifest.phase_by_name(str(route.get("phase") or ""))
+        return preceding is not None and preceding.kind in {"gate", "script"}
 
     def _park(self, phase_name: str, attempt: int) -> str:
         """Give up on a phase without either keeping or losing the rejected work.

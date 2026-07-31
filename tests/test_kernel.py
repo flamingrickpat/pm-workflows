@@ -135,6 +135,49 @@ phases:
 """
 
 
+REVIEW_PENDING_CANDIDATE = """\
+---
+name: review-pending-candidate
+driver: {kind: claude, model: sonnet}
+checkpoint_backend: {kind: git, repo_path: "${TARGET}"}
+human_resolver: {mode: forbid}
+roles:
+  worker:
+    skill: skills/x/SKILL.md
+    result_contract:
+      type: json
+      schema:
+        status: {enum: [done]}
+  reviewer:
+    skill: skills/x/SKILL.md
+    result_contract:
+      type: json
+      schema:
+        status: {enum: [pass]}
+phases:
+  - name: work
+    kind: role
+    role: worker
+    on_status: {done: check}
+    on_invalid: {action: stop}
+  - name: check
+    kind: gate
+    predicate: scripts/check.py
+    on_pass: review
+    on_fail: {action: stop}
+  - name: review
+    kind: role
+    role: reviewer
+    checkpoint_after: true
+    on_status: {pass: finish}
+    on_invalid: {action: stop}
+  - name: finish
+    kind: script
+    script: scripts/check.py
+---
+"""
+
+
 def test_declared_status_routes_to_the_declared_phase(tmp_path: Path) -> None:
     repo = make_repo(tmp_path)
     base = make_base(tmp_path, TWO_STEP, {"check.py": PASSING_CHECK})
@@ -147,6 +190,35 @@ def test_declared_status_routes_to_the_declared_phase(tmp_path: Path) -> None:
     kinds = [(e["phase"], e["kind"], e.get("verdict")) for e in _journal(tmp_path)]
     assert ("work", "role", "done") in kinds
     assert ("check", "gate", "pass") in kinds
+
+
+def test_reviewer_keeps_candidate_while_parking_untracked_debris(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    base = make_base(tmp_path, REVIEW_PENDING_CANDIDATE, {"check.py": PASSING_CHECK})
+    reviewed: list[str] = []
+
+    def make_candidate(work_dir: Path, call: int, prompt: str) -> None:
+        if call == 1:
+            (work_dir / "product.txt").write_text("candidate\n", encoding="utf-8")
+            git(work_dir, "add", "product.txt")
+            git(work_dir, "commit", "-m", "candidate")
+            (work_dir / "reference-clone").mkdir()
+            (work_dir / "reference-clone" / "README.md").write_text("metadata\n", encoding="utf-8")
+        else:
+            reviewed.append((work_dir / "product.txt").read_text(encoding="utf-8"))
+
+    result = run_kernel(
+        base,
+        repo,
+        StubDriver([{"status": "done"}, {"status": "pass"}], on_call=make_candidate),
+        tmp_path,
+    )
+
+    assert result["ok"], result["exit_reason"]
+    assert reviewed == ["candidate\n"]
+    assert not (repo / "reference-clone").exists()
+    leftovers = [entry for entry in _journal(tmp_path) if entry.get("kind") == "leftover"]
+    assert leftovers[-1]["reason_codes"][-1] == "preserved_candidate"
 
 
 def test_a_self_route_dispatches_the_same_role_again(tmp_path: Path) -> None:
