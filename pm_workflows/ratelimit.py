@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import re
 import subprocess
+from collections.abc import Mapping
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -257,6 +258,7 @@ def run_process(
     cwd: Path,
     timeout: int = 7200,
     input_text: str | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     command = [resolve_executable(command[0]), *command[1:]]
     result = subprocess.run(
@@ -268,6 +270,7 @@ def run_process(
         encoding="utf-8",
         errors="replace",
         timeout=timeout,
+        env=environment,
     )
     if result.returncode != 0:
         raise ProcessError(command, result.returncode, result.stdout, result.stderr)
@@ -280,10 +283,13 @@ def run_agent_process(
     cwd: Path,
     timeout: int = 7200,
     input_text: str | None = None,
+    environment: Mapping[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run an agent CLI, converting usage limits into TokenLimitError."""
     try:
-        return run_process(command, cwd, timeout, input_text=input_text)
+        return run_process(
+            command, cwd, timeout, input_text=input_text, environment=environment
+        )
     except ProcessError as exc:
         token_limit = token_limit_from_process_error(agent_kind, exc)
         if token_limit is not None:

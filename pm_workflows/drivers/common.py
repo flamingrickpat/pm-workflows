@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -145,6 +146,11 @@ def invoke_cli(
     timeout_seconds: int,
 ) -> CommandOutcome:
     """Run a CLI while preserving token-limit exceptions for the kernel."""
+    # The kernel may need PYTHONPATH for a source checkout or repaired venv.
+    # Do not leak it into a coding agent: its target interpreter must resolve
+    # compiled packages (for example ``regex``) from the target environment.
+    child_environment = os.environ.copy()
+    child_environment.pop("PYTHONPATH", None)
     try:
         completed = run_agent_process(
             agent_kind,
@@ -152,6 +158,7 @@ def invoke_cli(
             work_dir,
             timeout=timeout_seconds,
             input_text=prompt,
+            environment=child_environment,
         )
         return CommandOutcome(
             stdout=completed.stdout or "",

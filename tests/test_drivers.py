@@ -12,6 +12,7 @@ from pm_workflows.drivers import (
     build_driver,
 )
 from pm_workflows.drivers.common import CommandOutcome
+from pm_workflows.drivers import common
 from pm_workflows.manifest import parse_workflow
 
 
@@ -65,6 +66,20 @@ def test_codex_uses_exec_stdin_and_last_message(
     assert result.result_json == {"status": "done", "summary": "ok"}
     assert result.session_ref == "thread-1"
     assert result.usage["input_tokens"] == 10
+
+
+def test_cli_children_do_not_inherit_pythonpath(tmp_path: Path, monkeypatch) -> None:
+    seen: dict[str, object] = {}
+
+    def fake_run_agent_process(*args, **kwargs):
+        seen["environment"] = kwargs["environment"]
+        return subprocess.CompletedProcess(args[1], 0, stdout="", stderr="")
+
+    monkeypatch.setenv("PYTHONPATH", r"C:\kernel\.venv\Lib\site-packages")
+    monkeypatch.setattr(common, "run_agent_process", fake_run_agent_process)
+    common.invoke_cli("codex", ["codex", "exec"], tmp_path, "prompt", 1)
+
+    assert "PYTHONPATH" not in seen["environment"]
 
 
 def test_pi_loads_the_selected_skill_and_pipes_the_prompt(
