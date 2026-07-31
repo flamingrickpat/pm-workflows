@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pm-workflows"
+version = "0.1.0"
+description = "Manifest-driven workflow kernel for bounded agent workflows"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.11"
+dependencies = [
+    "pm-coder @ git+https://github.com/flamingrickpat/pm-coder.git",
+    "PyYAML>=6,<7",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<10",
+]
+
+[project.scripts]
+pm-workflows = "pm_workflows.execute_workflow:main"
+
+[tool.setuptools.packages.find]
+include = ["pm_workflows*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
