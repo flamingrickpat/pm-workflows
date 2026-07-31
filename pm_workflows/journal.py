@@ -16,6 +16,10 @@ from .protocol import JournalEntry
 EXECUTION_KINDS = frozenset({"role", "gate", "script", "human", "loop"})
 
 
+def _failure_key(value: str) -> str:
+    return " ".join(value.split()).casefold()
+
+
 class Journal:
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -88,3 +92,36 @@ class Journal:
             if entry.get("phase") == phase and not entry.get("ok", False):
                 errors.extend(entry.get("errors", []))
         return errors
+
+    def active_failure_causes(self, phase: str) -> list[str]:
+        """Return the deduplicated retry memory for one destination phase."""
+        causes: list[str] = []
+        keys: set[str] = set()
+        for entry in self.read_all():
+            if entry.get("kind") != "failure_memory" or entry.get("phase") != phase:
+                continue
+            if entry.get("verdict") == "cleared":
+                causes.clear()
+                keys.clear()
+                continue
+            if entry.get("verdict") != "recorded":
+                continue
+            for value in entry.get("errors", []):
+                if not isinstance(value, str) or not value.strip():
+                    continue
+                cause = " ".join(value.split())
+                key = _failure_key(cause)
+                if key not in keys:
+                    keys.add(key)
+                    causes.append(cause)
+        return causes
+
+    def phases_with_failure_memory(self) -> list[str]:
+        phases: list[str] = []
+        for entry in self.read_all():
+            if entry.get("kind") != "failure_memory":
+                continue
+            phase = entry.get("phase")
+            if isinstance(phase, str) and phase not in phases:
+                phases.append(phase)
+        return [phase for phase in phases if self.active_failure_causes(phase)]

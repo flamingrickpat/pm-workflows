@@ -218,6 +218,13 @@ def test_a_failed_check_reverts_the_repo_and_feeds_back_the_reason(tmp_path: Pat
     # The retried session was told why, in the check's own words.
     assert "the artifact is missing a Status line" in driver.prompts[1]
     assert "reset to the last accepted commit" in driver.prompts[1]
+    assert driver.prompts[2].count("the artifact is missing a Status line") == 1
+    remembered = [
+        entry for entry in _journal(tmp_path)
+        if entry.get("kind") == "failure_memory"
+        and entry.get("verdict") == "recorded"
+    ]
+    assert len(remembered) == 1
 
 
 def test_a_contract_violation_is_not_treated_as_an_outcome(tmp_path: Path) -> None:
@@ -243,6 +250,12 @@ def test_a_contract_violation_is_not_treated_as_an_outcome(tmp_path: Path) -> No
     assert "final message" in reasons
     assert "not one of the allowed" in reasons
     assert "missing required field" in reasons
+    assert "final message" in driver.prompts[1]
+    assert "final message" in driver.prompts[2]
+    assert "not one of the allowed" in driver.prompts[2]
+    assert "final message" in driver.prompts[3]
+    assert "not one of the allowed" in driver.prompts[3]
+    assert "missing required field" in driver.prompts[3]
 
 
 LOOP = """\

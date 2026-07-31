@@ -54,7 +54,8 @@ class JournalEntry:
     """One append-only journal record."""
     run_id: str
     phase: str
-    kind: str  # role | gate | script | human | checkpoint | retry | escalate | loop
+    # role | gate | script | human | checkpoint | failure_memory | escalate | loop
+    kind: str
     role: str | None = None
     attempt: int = 0
     ok: bool = False

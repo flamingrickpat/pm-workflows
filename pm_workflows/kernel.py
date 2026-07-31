@@ -407,7 +407,7 @@ class Kernel:
                 f"role '{role.name}' points at a missing skill: {skill_path}"
             )
 
-        feedback = self.pending_feedback
+        feedback = self.pending_feedback or self._feedback(phase.name)
         self.pending_feedback = None
         answer = self.pending_answer
         self.pending_answer = None
@@ -478,7 +478,7 @@ class Kernel:
         """Validate the agent's result against the role's declared contract."""
         errors: list[str] = []
         if agent.error:
-            errors.append(agent.error[-500:])
+            errors.append(agent.error[:1000])
         payload = agent.result_json
         if not isinstance(payload, dict):
             errors.append(
@@ -701,8 +701,9 @@ class Kernel:
             ))
             return None
 
+        self._remember_failures(target, phase.name, result)
         self._revert(phase.name, target)
-        self.pending_feedback = self._feedback(phase, result)
+        self.pending_feedback = self._feedback(target)
         return target
 
     def _resolve_target(self, phase: PhaseConfig, target: str | None) -> PhaseConfig | None:
@@ -724,6 +725,7 @@ class Kernel:
                         candidate_rev=(self.checkpoint.current_rev() if self.checkpoint else None),
                     ))
                     print(f"    item complete: {self.current_item}")
+                self._clear_failure_memory(f"item_complete={self.current_item or '(none)'}")
                 self.current_item = None
                 return loop
             self.current_item = None
@@ -735,13 +737,46 @@ class Kernel:
             self.exit_reason = f"{phase.name}: routed to unknown phase '{target}'"
         return resolved
 
-    def _feedback(self, phase: PhaseConfig, result: dict[str, Any]) -> str:
+    def _remember_failures(
+        self,
+        target: str,
+        source: str,
+        result: dict[str, Any],
+    ) -> None:
+        existing = {
+            " ".join(value.split()).casefold()
+            for value in self.journal.active_failure_causes(target)
+        }
+        errors = result.get("errors") or ["The controller recorded no error detail."]
+        additions: list[str] = []
+        for value in errors:
+            cause = " ".join(str(value).split())
+            key = cause.casefold()
+            if cause and key not in existing:
+                existing.add(key)
+                additions.append(cause)
+        if not additions:
+            return
+        self.journal.append(JournalEntry(
+            run_id=self.run_id,
+            phase=target,
+            kind="failure_memory",
+            ok=False,
+            verdict="recorded",
+            reason_codes=[f"source={source}"],
+            errors=additions,
+            item=self.current_item,
+        ))
+
+    def _feedback(self, target: str) -> str | None:
+        errors = self.journal.active_failure_causes(target)
+        if not errors:
+            return None
         lines = [
-            f"Your previous attempt was rejected at the '{phase.name}' step.",
+            f"Earlier attempts routed back to the '{target}' step.",
             "",
-            "Problems found:",
+            "Fix every failure cause in this accumulated list:",
         ]
-        errors = result.get("errors") or ["(no detail recorded)"]
         for error in errors:
             lines.append(f"  - {error}")
         lines += [
@@ -752,10 +787,23 @@ class Kernel:
         ]
         return "\n".join(lines)
 
+    def _clear_failure_memory(self, reason: str) -> None:
+        for target in self.journal.phases_with_failure_memory():
+            self.journal.append(JournalEntry(
+                run_id=self.run_id,
+                phase=target,
+                kind="failure_memory",
+                ok=True,
+                verdict="cleared",
+                reason_codes=[reason],
+                item=self.current_item,
+            ))
+
     # ------------------------------------------------------------ checkpoints
 
     def _accept(self, phase_name: str, attempt: int) -> None:
         if self.checkpoint is None:
+            self._clear_failure_memory(f"accepted={phase_name}")
             return
         rev = self.checkpoint.snapshot(f"{self.task_id} {phase_name} attempt {attempt}")
         if rev and rev != self.accepted_revision:
@@ -765,6 +813,7 @@ class Kernel:
             run_id=self.run_id, phase=phase_name, kind="checkpoint", ok=True,
             candidate_rev=rev, verdict="accepted", item=self.current_item,
         ))
+        self._clear_failure_memory(f"accepted={phase_name}")
 
     def _settle_worktree(self, phase: PhaseConfig) -> None:
         """Never hand a role a repository that already has changes in it.
@@ -977,7 +1026,7 @@ class Kernel:
             lines.append("(nothing yet)")
         for index, entry in enumerate(entries, 1):
             kind = entry.get("kind", "?")
-            if kind in {"route", "checkpoint"}:
+            if kind in {"route", "checkpoint", "failure_memory"}:
                 continue
             verdict = entry.get("verdict", "")
             attempt = entry.get("attempt")

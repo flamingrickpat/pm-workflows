@@ -61,6 +61,40 @@ def test_journal_last_errors(tmp_path):
     assert "too small" in errors
 
 
+def test_failure_memory_deduplicates_and_clears(tmp_path):
+    j = Journal(tmp_path / "journal.jsonl")
+    j.append(JournalEntry(
+        run_id="r1",
+        phase="test",
+        kind="failure_memory",
+        verdict="recorded",
+        errors=["Wrong report path", "  wrong   report PATH  "],
+    ))
+    j.append(JournalEntry(
+        run_id="r1",
+        phase="test",
+        kind="failure_memory",
+        verdict="recorded",
+        errors=["Missing Status line"],
+    ))
+
+    assert j.active_failure_causes("test") == [
+        "Wrong report path",
+        "Missing Status line",
+    ]
+    assert j.phases_with_failure_memory() == ["test"]
+
+    j.append(JournalEntry(
+        run_id="r1",
+        phase="test",
+        kind="failure_memory",
+        verdict="cleared",
+        ok=True,
+    ))
+    assert j.active_failure_causes("test") == []
+    assert j.phases_with_failure_memory() == []
+
+
 def test_journal_creates_parent_dirs(tmp_path):
     j = Journal(tmp_path / "deep" / "nested" / "journal.jsonl")
     assert j.path.parent.exists()
