@@ -156,6 +156,28 @@ def test_pm_coder_writes_kernel_artifacts(tmp_path: Path, monkeypatch) -> None:
     assert Path(result.trace_path).is_file()
 
 
+def test_pm_coder_preserves_full_exception_diagnostics(
+    tmp_path: Path, monkeypatch
+) -> None:
+    work = tmp_path / "repo"
+    work.mkdir()
+    trace = tmp_path / "private" / "trace.jsonl"
+
+    def fake_run(prompt, **kwargs):
+        raise RuntimeError("diagnostic test failure")
+
+    monkeypatch.setattr("pm_workflows.drivers.minimal_agent.run_auto_sync", fake_run)
+    result = MinimalAgentDriver().run_session(
+        "run", 1, "skill.md", "do it", work, trace_file=trace
+    )
+
+    assert result.exit_code == 1
+    event = json.loads(trace.read_text(encoding="utf-8").splitlines()[-1])
+    assert event["exception_type"] == "RuntimeError"
+    assert event["exception_message"] == "diagnostic test failure"
+    assert "RuntimeError: diagnostic test failure" in event["exception_traceback"]
+
+
 def test_shipped_workflows_are_agent_neutral() -> None:
     root = Path(__file__).resolve().parents[1]
     variables = {

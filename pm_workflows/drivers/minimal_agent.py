@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import traceback
 from pathlib import Path
 from typing import Any
 
@@ -77,7 +78,13 @@ class PmCoderDriver:
             stdout = ""
             result_json = None
             usage = {}
-            error = f"{type(exc).__name__}: {exc}"[-2000:]
+            exception_type = type(exc).__name__
+            exception_message = str(exc)
+            exception_traceback = traceback.format_exc()
+            # Keep the public/kernel error short. The complete diagnostic is
+            # written to the private trace artifact below so it cannot be fed
+            # back into the model as workflow feedback.
+            error = f"{exception_type}: {exception_message}"[-2000:]
             exit_code = 1
 
         if result_file is not None:
@@ -94,6 +101,9 @@ class PmCoderDriver:
             "final_text": stdout,
             "error": error,
             "result": result_json,
+            "exception_type": exception_type if exit_code else None,
+            "exception_message": exception_message if exit_code else None,
+            "exception_traceback": exception_traceback if exit_code else None,
         })
         return AgentResult(
             exit_code=exit_code,
