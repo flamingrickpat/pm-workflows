@@ -170,7 +170,7 @@ phases:
     role: reviewer
     checkpoint_after: true
     on_status: {pass: finish}
-    on_invalid: {action: stop}
+    on_invalid: {action: retry_with_feedback, target: review, preserve_candidate: true}
   - name: finish
     kind: script
     script: scripts/check.py
@@ -219,6 +219,33 @@ def test_reviewer_keeps_candidate_while_parking_untracked_debris(tmp_path: Path)
     assert not (repo / "reference-clone").exists()
     leftovers = [entry for entry in _journal(tmp_path) if entry.get("kind") == "leftover"]
     assert leftovers[-1]["reason_codes"][-1] == "preserved_candidate"
+
+
+def test_reviewer_retry_preserves_a_clean_candidate_and_failure_feedback(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    base = make_base(tmp_path, REVIEW_PENDING_CANDIDATE, {"check.py": PASSING_CHECK})
+    reviewed: list[str] = []
+
+    def make_candidate(work_dir: Path, call: int, prompt: str) -> None:
+        if call == 1:
+            (work_dir / "product.txt").write_text("candidate\n", encoding="utf-8")
+            git(work_dir, "add", "product.txt")
+            git(work_dir, "commit", "-m", "candidate")
+        elif call == 3:
+            reviewed.append((work_dir / "product.txt").read_text(encoding="utf-8"))
+
+    driver = StubDriver(
+        [{"status": "done"}, "not json", {"status": "pass"}],
+        on_call=make_candidate,
+    )
+    result = run_kernel(base, repo, driver, tmp_path)
+
+    assert result["ok"], result["exit_reason"]
+    assert reviewed == ["candidate\n"]
+    assert "clean candidate commit" in driver.prompts[2]
+    assert "No JSON result object" in driver.prompts[2]
+    reverts = [entry for entry in _journal(tmp_path) if entry.get("kind") == "revert"]
+    assert reverts[-1]["verdict"] == "preserve_before:review"
 
 
 def test_a_self_route_dispatches_the_same_role_again(tmp_path: Path) -> None:

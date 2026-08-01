@@ -708,8 +708,11 @@ class Kernel:
             return None
 
         self._remember_failures(target, phase.name, result)
-        self._revert(phase.name, target)
-        self.pending_feedback = self._feedback(target)
+        preserved_candidate = bool(config.get("preserve_candidate", False))
+        reset = self._revert(
+            phase.name, target, preserve_candidate=preserved_candidate
+        )
+        self.pending_feedback = self._feedback(target, reset=reset)
         return target
 
     def _resolve_target(self, phase: PhaseConfig, target: str | None) -> PhaseConfig | None:
@@ -774,7 +777,7 @@ class Kernel:
             item=self.current_item,
         ))
 
-    def _feedback(self, target: str) -> str | None:
+    def _feedback(self, target: str, *, reset: bool = True) -> str | None:
         errors = self.journal.active_failure_causes(target)
         if not errors:
             return None
@@ -785,12 +788,18 @@ class Kernel:
         ]
         for error in errors:
             lines.append(f"  - {error}")
-        lines += [
-            "",
-            "The repository has been reset to the last accepted commit, so none of",
-            "your previous changes are present. Start from the current state, fix",
-            "the cause of these problems, and do not repeat the same approach.",
-        ]
+        lines.append("")
+        if reset:
+            lines += [
+                "The repository has been reset to the last accepted commit, so none of",
+                "your previous changes are present. Start from the current state, fix",
+                "the cause of these problems, and do not repeat the same approach.",
+            ]
+        else:
+            lines += [
+                "The clean candidate commit being validated has been preserved for this",
+                "retry. Review the current state; do not recreate or discard that work.",
+            ]
         return "\n".join(lines)
 
     def _clear_failure_memory(self, reason: str) -> None:
@@ -898,9 +907,24 @@ class Kernel:
             print(f"    repository reset to {self.accepted_revision[:8]}")
         return parked
 
-    def _revert(self, from_phase: str, target: str) -> None:
+    def _revert(
+        self, from_phase: str, target: str, *, preserve_candidate: bool = False
+    ) -> bool:
         if self.checkpoint is None or not self.accepted_revision:
-            return
+            return False
+        head = self.checkpoint.current_rev()
+        if (
+            preserve_candidate
+            and not self.checkpoint.is_dirty()
+            and head != self.accepted_revision
+        ):
+            print(f"    preserving candidate {head[:8]} before retrying '{target}'")
+            self.journal.append(JournalEntry(
+                run_id=self.run_id, phase=from_phase, kind="revert", ok=True,
+                base_rev=self.accepted_revision, candidate_rev=head,
+                verdict=f"preserve_before:{target}", item=self.current_item,
+            ))
+            return False
         print(f"    revert to {self.accepted_revision[:8]} before retrying '{target}'")
         self.checkpoint.restore(self.accepted_revision)
         self.journal.append(JournalEntry(
@@ -908,6 +932,7 @@ class Kernel:
             base_rev=self.accepted_revision, verdict=f"revert_before:{target}",
             item=self.current_item,
         ))
+        return True
 
     # ---------------------------------------------------------------- prompts
 
