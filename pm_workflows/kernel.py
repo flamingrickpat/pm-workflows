@@ -14,6 +14,7 @@ same role is dispatched again with the failure as feedback.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -21,8 +22,8 @@ import shutil
 import urllib.error
 import urllib.request
 from copy import copy
-from pathlib import Path
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from .checkpoint import GitCheckpoint
@@ -946,9 +947,12 @@ class Kernel:
                 stable_field = stable_field[len(prefix):]
             stable_id = str(dotted(item, stable_field))
         configured_task_id = str(expand_runtime(task.id, variables))
-        child_task_id = f"{configured_task_id}.__attempt_{attempt:04d}"
-        if phase.foreach is not None:
-            child_task_id += f".__item_{self._safe_name(stable_id)}"
+        child_task_id = self._child_task_id(
+            self.workspace / "agents" / "tasks",
+            configured_task_id,
+            attempt,
+            stable_id if phase.foreach is not None else None,
+        )
         invocation = f"{self._safe_name(phase.name)}-{attempt:04d}-{index:04d}"
         child_root = self.kernel_data / "children" / invocation
         durable_receipt = child_root / "receipt.json"
@@ -1142,6 +1146,29 @@ class Kernel:
     @staticmethod
     def _safe_name(value: str) -> str:
         return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-._") or "child"
+
+    @classmethod
+    def _child_task_id(
+        cls,
+        tasks_root: Path,
+        configured_task_id: str,
+        attempt: int,
+        stable_id: str | None,
+    ) -> str:
+        """Keep recursive child paths bounded without changing short task IDs."""
+        candidate = f"{configured_task_id}.__attempt_{attempt:04d}"
+        if stable_id is not None:
+            candidate += f".__item_{cls._safe_name(stable_id)}"
+        candidate_path = tasks_root / candidate
+        if len(candidate) <= 120 and len(str(candidate_path)) <= 220:
+            return candidate
+
+        digest = hashlib.sha256(candidate.encode("utf-8")).hexdigest()[:16]
+        suffix = f".__h_{digest}.__attempt_{attempt:04d}"
+        component_limit = min(120, max(48, 220 - len(str(tasks_root)) - 1))
+        prefix_length = max(1, component_limit - len(suffix))
+        prefix = cls._safe_name(configured_task_id)[:prefix_length].rstrip("-._")
+        return f"{prefix or 'child'}{suffix}"
 
     # --------------------------------------------------------------- routing
 

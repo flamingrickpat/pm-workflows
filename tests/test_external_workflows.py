@@ -277,6 +277,28 @@ phases:
     assert '"id": "b"' in driver.prompts[1]
 
 
+def test_recursive_child_task_ids_are_bounded_without_changing_short_ids(
+    tmp_path: Path,
+) -> None:
+    tasks_root = tmp_path / "repo" / "agents" / "tasks"
+
+    short = Kernel._child_task_id(tasks_root, "parent.leaf", 1, "leaf-a")
+    assert short == "parent.leaf.__attempt_0001.__item_leaf-a"
+
+    configured = ".".join(["parent"] + ["nested-child-with-a-readable-name"] * 12)
+    first = Kernel._child_task_id(tasks_root, configured, 1, "stable-a")
+    repeated = Kernel._child_task_id(tasks_root, configured, 1, "stable-a")
+    next_attempt = Kernel._child_task_id(tasks_root, configured, 2, "stable-a")
+    other_item = Kernel._child_task_id(tasks_root, configured, 1, "stable-b")
+
+    assert first == repeated
+    assert first != next_attempt
+    assert first != other_item
+    assert len(first) <= 120
+    assert len(str(tasks_root / first)) <= 220
+    assert ".__h_" in first
+
+
 def test_child_mcp_allowlist_is_materialized_for_the_driver(tmp_path: Path) -> None:
     class McpDriver(StubDriver):
         supports_explicit_mcp_config = True
