@@ -22,4 +22,5 @@ class AgentDriver(Protocol):
         tools: list[str] | None = None,
         result_file: Path | None = None,
         trace_file: Path | None = None,
+        mcp_config: Path | None = None,
     ) -> AgentResult: ...

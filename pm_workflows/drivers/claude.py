@@ -18,6 +18,7 @@ from .common import (
 
 class ClaudeDriver:
     kind = "claude"
+    supports_explicit_mcp_config = True
 
     def __init__(
         self,
@@ -41,6 +42,7 @@ class ClaudeDriver:
         tools: list[str] | None = None,
         result_file: Path | None = None,
         trace_file: Path | None = None,
+        mcp_config: Path | None = None,
     ) -> AgentResult:
         work_dir = Path(work_dir)
         session_id = str(uuid.uuid4())
@@ -58,7 +60,9 @@ class ClaudeDriver:
         ))
         for directory in self.add_dirs:
             command.extend(("--add-dir", directory))
-        mcp_config = deployed_mcp_config(work_dir)
+        mcp_config = (
+            Path(mcp_config) if mcp_config is not None else deployed_mcp_config(work_dir)
+        )
         if mcp_config is not None:
             command.extend((
                 "--mcp-config",

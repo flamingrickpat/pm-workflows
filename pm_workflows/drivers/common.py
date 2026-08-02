@@ -18,9 +18,11 @@ def deployed_mcp_config(work_dir: Path) -> Path | None:
     return path if path.is_file() else None
 
 
-def codex_mcp_override(work_dir: Path) -> str | None:
+def codex_mcp_override(
+    work_dir: Path, mcp_config: Path | None = None
+) -> str | None:
     """Serialize the target .mcp.json servers as a Codex TOML override."""
-    path = deployed_mcp_config(work_dir)
+    path = Path(mcp_config) if mcp_config is not None else deployed_mcp_config(work_dir)
     if path is None:
         return None
     payload = json.loads(path.read_text(encoding="utf-8"))

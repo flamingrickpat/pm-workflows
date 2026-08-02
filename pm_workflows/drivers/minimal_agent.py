@@ -17,6 +17,7 @@ class PmCoderDriver:
     """Run one fresh role session through the installed ``pm-coder`` package."""
 
     kind = "pm-coder"
+    supports_explicit_mcp_config = True
 
     def __init__(
         self,
@@ -44,9 +45,12 @@ class PmCoderDriver:
         tools: list[str] | None = None,
         result_file: Path | None = None,
         trace_file: Path | None = None,
+        mcp_config: Path | None = None,
     ) -> AgentResult:
         work_dir = Path(work_dir).resolve()
-        mcp_config = deployed_mcp_config(work_dir)
+        mcp_config = (
+            Path(mcp_config) if mcp_config is not None else deployed_mcp_config(work_dir)
+        )
         trace_write(trace_file, {
             "event": "start",
             "agent": self.kind,

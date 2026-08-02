@@ -15,7 +15,7 @@ from .drivers import (
 )
 from .journal import Journal
 from .kernel import Kernel
-from .manifest import ManifestError, Workflow, parse_workflow
+from .manifest import ManifestError, StatePolicyConfig, Workflow, parse_workflow
 from .protocol import AgentResult, GateResult, JournalEntry, PhaseConfig, RoleConfig
 
 __all__ = [
@@ -33,6 +33,7 @@ __all__ = [
     "PiDriver",
     "PhaseConfig",
     "RoleConfig",
+    "StatePolicyConfig",
     "Workflow",
     "build_driver",
     "parse_workflow",

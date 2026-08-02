@@ -14,6 +14,7 @@ from .common import (
 
 class PiDriver:
     kind = "pi"
+    supports_explicit_mcp_config = True
 
     def __init__(
         self,
@@ -35,6 +36,7 @@ class PiDriver:
         tools: list[str] | None = None,
         result_file: Path | None = None,
         trace_file: Path | None = None,
+        mcp_config: Path | None = None,
     ) -> AgentResult:
         work_dir = Path(work_dir)
         command = [
@@ -51,7 +53,7 @@ class PiDriver:
             command.extend(("--model", self.model))
         if self.effort:
             command.extend(("--thinking", self.effort))
-        mcp_config = work_dir / ".mcp.json"
+        mcp_config = Path(mcp_config) if mcp_config is not None else work_dir / ".mcp.json"
         if mcp_config.is_file():
             command.extend(("--mcp-config", str(mcp_config)))
 

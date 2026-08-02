@@ -15,6 +15,13 @@ from typing import Any
 import yaml
 
 from .protocol import (
+    ChildCapabilitiesConfig,
+    ChildContextConfig,
+    ChildLimitsConfig,
+    ChildResultConfig,
+    ChildTaskConfig,
+    ChildWorkspaceConfig,
+    ForeachConfig,
     RESERVED_ROUTES,
     ROUTE_EXIT_LOOP,
     ROUTE_NEXT_ITEM,
@@ -74,6 +81,71 @@ class BudgetsConfig:
 
 
 @dataclass
+class StatePolicyConfig:
+    """Configurable retry semantics; legacy values preserve the old kernel."""
+
+    mutation_model: str = "transactional"
+    on_resume: str = "legacy"
+    before_role: str = "settle"
+    on_retry: str = "restore"
+    on_exhaustion: str = "park_and_restore"
+    attempt_receipts: str = "journal"
+    feedback: str = "accumulated"
+
+
+def _parse_state_policy(raw: Any, path: Path) -> StatePolicyConfig:
+    values = _mapping(raw, path, "state_policy")
+    model = str(values.get("mutation_model", "transactional"))
+    presets = {
+        "transactional": StatePolicyConfig(),
+        "external": StatePolicyConfig(
+            mutation_model="external",
+            on_resume="retain",
+            before_role="retain",
+            on_retry="retain",
+            on_exhaustion="retain",
+            attempt_receipts="files",
+        ),
+        "append_only": StatePolicyConfig(
+            mutation_model="append_only",
+            on_resume="retain",
+            before_role="retain",
+            on_retry="retain",
+            on_exhaustion="retain",
+            attempt_receipts="files",
+        ),
+    }
+    if model not in presets:
+        raise ManifestError(
+            f"{path}: state_policy.mutation_model must be one of "
+            f"{', '.join(presets)}, got '{model}'"
+        )
+    policy = presets[model]
+    for field_name in (
+        "on_resume", "before_role", "on_retry", "on_exhaustion",
+        "attempt_receipts", "feedback"
+    ):
+        if field_name in values:
+            setattr(policy, field_name, str(values[field_name]))
+    allowed = {
+        "on_resume": {"legacy", "retain"},
+        "before_role": {"settle", "retain"},
+        "on_retry": {"restore", "retain", "preserve_candidate"},
+        "on_exhaustion": {"park_and_restore", "retain"},
+        "attempt_receipts": {"journal", "files"},
+        "feedback": {"accumulated", "latest", "none"},
+    }
+    for field_name, choices in allowed.items():
+        value = getattr(policy, field_name)
+        if value not in choices:
+            raise ManifestError(
+                f"{path}: state_policy.{field_name} must be one of "
+                f"{', '.join(sorted(choices))}, got '{value}'"
+            )
+    return policy
+
+
+@dataclass
 class Workflow:
     name: str
     description: str
@@ -85,6 +157,7 @@ class Workflow:
     failure_policy: FailurePolicyConfig
     human_resolver: HumanResolverConfig
     budgets: BudgetsConfig
+    state_policy: StatePolicyConfig
     body: str = ""
     path: str = ""
 
@@ -149,6 +222,118 @@ def _parse_contract(raw: Any) -> ResultContract:
     )
 
 
+def _mapping(raw: Any, path: Path, label: str) -> dict[str, Any]:
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ManifestError(f"{path}: {label} must be a mapping")
+    return raw
+
+
+def _string_list(raw: Any, path: Path, label: str) -> list[str]:
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ManifestError(f"{path}: {label} must be a list")
+    return [str(value) for value in raw]
+
+
+def _parse_child_fields(raw: dict[str, Any], path: Path, name: str) -> dict[str, Any]:
+    task_raw = _mapping(raw.get("task"), path, f"phase '{name}' task")
+    workspace_raw = _mapping(raw.get("workspace"), path, f"phase '{name}' workspace")
+    context_raw = _mapping(raw.get("context"), path, f"phase '{name}' context")
+    capabilities_raw = _mapping(
+        raw.get("capabilities"), path, f"phase '{name}' capabilities"
+    )
+    limits_raw = _mapping(raw.get("limits"), path, f"phase '{name}' limits")
+    result_raw = _mapping(raw.get("result"), path, f"phase '{name}' result")
+    foreach_raw = _mapping(raw.get("foreach"), path, f"phase '{name}' foreach")
+
+    return {
+        "task": ChildTaskConfig(
+            id=str(task_raw.get("id", "")),
+            input=_mapping(task_raw.get("input"), path, f"phase '{name}' task.input"),
+        ) if task_raw else None,
+        "workspace": ChildWorkspaceConfig(
+            mode=str(workspace_raw.get("mode", "shared")),
+            merge=str(workspace_raw.get("merge", "artifacts_only")),
+            artifact_prefix=str(workspace_raw.get("artifact_prefix", "")),
+        ) if workspace_raw else None,
+        "context": ChildContextConfig(
+            inherit=bool(context_raw.get("inherit", False)),
+            include=_string_list(
+                context_raw.get("include"), path, f"phase '{name}' context.include"
+            ),
+            exclude=_string_list(
+                context_raw.get("exclude"), path, f"phase '{name}' context.exclude"
+            ),
+        ) if context_raw else None,
+        "capabilities": ChildCapabilitiesConfig(
+            inherit=bool(capabilities_raw.get("inherit", False)),
+            allow_mcp=_string_list(
+                capabilities_raw.get("allow_mcp"),
+                path,
+                f"phase '{name}' capabilities.allow_mcp",
+            ),
+            allow_effects=_string_list(
+                capabilities_raw.get("allow_effects"),
+                path,
+                f"phase '{name}' capabilities.allow_effects",
+            ),
+            require_http_reachable=bool(
+                capabilities_raw.get("require_http_reachable", True)
+            ),
+            http_timeout_seconds=float(
+                capabilities_raw.get("http_timeout_seconds", 5.0)
+            ),
+        ) if capabilities_raw else None,
+        "limits": ChildLimitsConfig(
+            decrement_depth=int(limits_raw.get("decrement_depth", 1)),
+            max_depth=(
+                int(limits_raw["max_depth"])
+                if limits_raw.get("max_depth") is not None else None
+            ),
+            max_attempts=int(limits_raw.get("max_attempts", 1)),
+            max_agent_requests=(
+                int(limits_raw["max_agent_requests"])
+                if limits_raw.get("max_agent_requests") is not None else None
+            ),
+        ) if limits_raw else None,
+        "child_result": ChildResultConfig(
+            statuses=_string_list(
+                result_raw.get("statuses"), path, f"phase '{name}' result.statuses"
+            ),
+            artifacts=_string_list(
+                result_raw.get("artifacts"), path, f"phase '{name}' result.artifacts"
+            ),
+            status_from=str(result_raw.get("status_from", "")),
+            status_map={
+                str(key): str(value)
+                for key, value in _mapping(
+                    result_raw.get("status_map"),
+                    path,
+                    f"phase '{name}' result.status_map",
+                ).items()
+            },
+            default_status=str(result_raw.get("default_status", "")),
+            aggregate=str(result_raw.get("aggregate", "")),
+            status_priority=_string_list(
+                result_raw.get("status_priority"),
+                path,
+                f"phase '{name}' result.status_priority",
+            ),
+        ) if result_raw else None,
+        "foreach": ForeachConfig(
+            source=str(foreach_raw.get("from", "")),
+            item=str(foreach_raw.get("item", "item")),
+            stable_id=str(foreach_raw.get("stable_id", "id")),
+            order=str(foreach_raw.get("order", "stable_id")),
+            max_items=int(foreach_raw.get("max_items", 32)),
+            stop_when=str(foreach_raw.get("stop_when", "")),
+        ) if foreach_raw else None,
+    }
+
+
 def _parse_phase(raw: dict[str, Any], path: Path) -> PhaseConfig:
     if not isinstance(raw, dict):
         raise ManifestError(f"{path}: phase entries must be mappings, got {type(raw)}")
@@ -167,6 +352,7 @@ def _parse_phase(raw: dict[str, Any], path: Path) -> PhaseConfig:
     if isinstance(args, str):
         args = [args]
 
+    child_fields = _parse_child_fields(raw, path, name)
     return PhaseConfig(
         name=name,
         kind=raw.get("kind", "role"),
@@ -191,6 +377,7 @@ def _parse_phase(raw: dict[str, Any], path: Path) -> PhaseConfig:
         max_iterations=raw.get("max_iterations", 200),
         workflow=raw.get("workflow"),
         allowed_roles=raw.get("allowed_roles", []) or [],
+        **child_fields,
     )
 
 
@@ -211,7 +398,7 @@ def _validate(workflow: Workflow) -> None:
             known.add(nested.name)
 
     def check_phase(phase: PhaseConfig, in_loop: bool) -> None:
-        if phase.kind not in {"role", "gate", "script", "loop", "human"}:
+        if phase.kind not in {"role", "gate", "script", "loop", "human", "workflow"}:
             raise ManifestError(f"{path}: phase '{phase.name}' has unknown kind '{phase.kind}'")
 
         for target in phase.route_targets():
@@ -290,6 +477,104 @@ def _validate(workflow: Workflow) -> None:
                     f"{path}: human phase '{phase.name}' has neither question nor "
                     "question_from_result"
                 )
+
+        if phase.kind == "workflow":
+            if not phase.workflow:
+                raise ManifestError(
+                    f"{path}: workflow phase '{phase.name}' names no workflow"
+                )
+            if phase.task is None or not phase.task.id:
+                raise ManifestError(
+                    f"{path}: workflow phase '{phase.name}' declares no task.id"
+                )
+            if phase.child_result is None or not phase.child_result.statuses:
+                raise ManifestError(
+                    f"{path}: workflow phase '{phase.name}' declares no result.statuses"
+                )
+            missing = [
+                status for status in phase.child_result.statuses
+                if status not in phase.on_status
+            ]
+            if missing:
+                raise ManifestError(
+                    f"{path}: workflow phase '{phase.name}' has no on_status route "
+                    f"for child status value(s): {', '.join(missing)}"
+                )
+            stray = [
+                status for status in phase.on_status
+                if status not in phase.child_result.statuses
+            ]
+            if stray:
+                raise ManifestError(
+                    f"{path}: workflow phase '{phase.name}' routes undeclared child "
+                    f"status value(s): {', '.join(stray)}"
+                )
+            if not phase.on_invalid:
+                raise ManifestError(
+                    f"{path}: workflow phase '{phase.name}' must declare on_invalid"
+                )
+            invalid_mapped = [
+                value for value in phase.child_result.status_map.values()
+                if value not in phase.child_result.statuses
+            ]
+            if invalid_mapped:
+                raise ManifestError(
+                    f"{path}: workflow phase '{phase.name}' status_map targets "
+                    f"undeclared status value(s): {', '.join(invalid_mapped)}"
+                )
+            if (
+                phase.child_result.default_status
+                and phase.child_result.default_status not in phase.child_result.statuses
+            ):
+                raise ManifestError(
+                    f"{path}: workflow phase '{phase.name}' default_status is not declared"
+                )
+            invalid_priority = [
+                value for value in phase.child_result.status_priority
+                if value not in phase.child_result.statuses
+            ]
+            if invalid_priority:
+                raise ManifestError(
+                    f"{path}: workflow phase '{phase.name}' status_priority includes "
+                    f"undeclared value(s): {', '.join(invalid_priority)}"
+                )
+            if phase.workspace and phase.workspace.mode != "shared":
+                raise ManifestError(
+                    f"{path}: workflow phase '{phase.name}' workspace.mode must be "
+                    "'shared'; isolated workspaces are not implemented"
+                )
+            if phase.workspace and phase.workspace.merge not in {"artifacts_only", "none"}:
+                raise ManifestError(
+                    f"{path}: workflow phase '{phase.name}' workspace.merge must be "
+                    "'artifacts_only' or 'none'"
+                )
+            if phase.capabilities and phase.capabilities.http_timeout_seconds <= 0:
+                raise ManifestError(
+                    f"{path}: workflow phase '{phase.name}' HTTP timeout must be positive"
+                )
+            if phase.limits:
+                if phase.limits.decrement_depth < 0:
+                    raise ManifestError(
+                        f"{path}: workflow phase '{phase.name}' decrement_depth cannot be negative"
+                    )
+                if phase.limits.max_attempts < 1:
+                    raise ManifestError(
+                        f"{path}: workflow phase '{phase.name}' max_attempts must be positive"
+                    )
+            if phase.foreach:
+                if not phase.foreach.source:
+                    raise ManifestError(
+                        f"{path}: workflow phase '{phase.name}' foreach.from is required"
+                    )
+                if phase.foreach.max_items < 1:
+                    raise ManifestError(
+                        f"{path}: workflow phase '{phase.name}' foreach.max_items must be positive"
+                    )
+                if phase.foreach.order not in {"stable_id", "dependency_topological_then_id"}:
+                    raise ManifestError(
+                        f"{path}: workflow phase '{phase.name}' has unsupported foreach.order "
+                        f"'{phase.foreach.order}'"
+                    )
 
         if phase.kind == "loop":
             if phase.iterator_source not in ITERATOR_SOURCES:
@@ -408,6 +693,7 @@ def parse_workflow(path: Path, variables: dict[str, str] | None = None) -> Workf
     hr_raw = fm.get("human_resolver", {}) or {}
     b_raw = fm.get("budgets", {}) or {}
     drv_raw = fm.get("driver", {}) or {}
+    state_policy = _parse_state_policy(fm.get("state_policy"), path)
 
     workflow = Workflow(
         name=fm.get("name", path.stem),
@@ -440,6 +726,7 @@ def parse_workflow(path: Path, variables: dict[str, str] | None = None) -> Workf
             max_wallclock_seconds=b_raw.get("max_wallclock_seconds", 999_999_999),
             max_depth=b_raw.get("max_depth", 1),
         ),
+        state_policy=state_policy,
         body=body,
         path=str(path),
     )

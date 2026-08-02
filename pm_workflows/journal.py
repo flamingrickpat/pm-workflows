@@ -13,7 +13,7 @@ from pathlib import Path
 from .protocol import JournalEntry
 
 # Kinds that count as an execution of a phase (used for attempt limits).
-EXECUTION_KINDS = frozenset({"role", "gate", "script", "human", "loop"})
+EXECUTION_KINDS = frozenset({"role", "gate", "script", "human", "loop", "workflow"})
 
 
 def _failure_key(value: str) -> str:

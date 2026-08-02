@@ -112,9 +112,81 @@ class RoleConfig:
 
 
 @dataclass
+class ChildTaskConfig:
+    """Task identity and explicit inputs for one child workflow invocation."""
+
+    id: str = ""
+    input: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass
+class ChildWorkspaceConfig:
+    """How child artifacts are exposed in a shared workspace."""
+
+    mode: str = "shared"
+    merge: str = "artifacts_only"
+    artifact_prefix: str = ""
+
+
+@dataclass
+class ChildContextConfig:
+    """Declarative context boundary recorded in the child receipt and prompt."""
+
+    inherit: bool = False
+    include: list[str] = field(default_factory=list)
+    exclude: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ChildCapabilitiesConfig:
+    """Capabilities a child may delegate to its roles."""
+
+    inherit: bool = False
+    allow_mcp: list[str] = field(default_factory=list)
+    allow_effects: list[str] = field(default_factory=list)
+    require_http_reachable: bool = True
+    http_timeout_seconds: float = 5.0
+
+
+@dataclass
+class ChildLimitsConfig:
+    """Limits applied to each child invocation."""
+
+    decrement_depth: int = 1
+    max_depth: int | None = None
+    max_attempts: int = 1
+    max_agent_requests: int | None = None
+
+
+@dataclass
+class ChildResultConfig:
+    """Typed public result projected from a child's private execution history."""
+
+    statuses: list[str] = field(default_factory=list)
+    artifacts: list[str] = field(default_factory=list)
+    status_from: str = ""
+    status_map: dict[str, str] = field(default_factory=dict)
+    default_status: str = ""
+    aggregate: str = ""
+    status_priority: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ForeachConfig:
+    """Deterministic fan-out over a structured artifact."""
+
+    source: str = ""
+    item: str = "item"
+    stable_id: str = "id"
+    order: str = "stable_id"
+    max_items: int = 32
+    stop_when: str = ""
+
+
+@dataclass
 class PhaseConfig:
     name: str
-    kind: str  # role | script | gate | loop | human
+    kind: str  # role | script | gate | loop | human | workflow
     route: str = "static"
     role: str | None = None
     next: str | None = None
@@ -150,6 +222,13 @@ class PhaseConfig:
 
     workflow: str | None = None
     allowed_roles: list[str] = field(default_factory=list)
+    task: ChildTaskConfig | None = None
+    workspace: ChildWorkspaceConfig | None = None
+    context: ChildContextConfig | None = None
+    capabilities: ChildCapabilitiesConfig | None = None
+    limits: ChildLimitsConfig | None = None
+    child_result: ChildResultConfig | None = None
+    foreach: ForeachConfig | None = None
 
     def body_by_name(self, name: str) -> "PhaseConfig | None":
         for p in self.body:

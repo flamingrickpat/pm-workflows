@@ -30,6 +30,7 @@ def _events(stdout: str) -> list[dict[str, Any]]:
 
 class CodexDriver:
     kind = "codex"
+    supports_explicit_mcp_config = True
 
     def __init__(
         self,
@@ -53,6 +54,7 @@ class CodexDriver:
         tools: list[str] | None = None,
         result_file: Path | None = None,
         trace_file: Path | None = None,
+        mcp_config: Path | None = None,
     ) -> AgentResult:
         work_dir = Path(work_dir)
         with tempfile.TemporaryDirectory(prefix="workflow-codex-") as temp:
@@ -75,7 +77,7 @@ class CodexDriver:
                     "--config",
                     f'model_reasoning_effort="{self.effort}"',
                 ))
-            mcp_override = codex_mcp_override(work_dir)
+            mcp_override = codex_mcp_override(work_dir, mcp_config)
             if mcp_override is not None:
                 command.extend(("--config", mcp_override))
             for directory in self.add_dirs:

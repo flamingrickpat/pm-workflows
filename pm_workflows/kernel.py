@@ -16,11 +16,23 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import shutil
+import urllib.error
+import urllib.request
+from copy import copy
 from pathlib import Path
 from datetime import datetime
 from typing import Any
 
 from .checkpoint import GitCheckpoint
+from .child import (
+    copy_declared_artifacts,
+    dotted,
+    expand_runtime,
+    load_reference,
+    order_items,
+)
 from .drivers import build_driver
 from .gates import run_gate
 from .journal import Journal
@@ -57,6 +69,11 @@ class Kernel:
         max_agent_requests: int | None = None,
         resume: bool = True,
         driver: Any = None,
+        depth_remaining: int | None = None,
+        allowed_mcp: set[str] | None = None,
+        allowed_effects: set[str] | None = None,
+        require_http_mcp: bool = False,
+        mcp_http_timeout: float = 5.0,
     ) -> None:
         self.manifest_path = Path(manifest_path)
         self.workspace = Path(workspace).resolve()
@@ -89,6 +106,15 @@ class Kernel:
             "BASE": str(self.base_dir),
         }
         self.manifest: Workflow = parse_workflow(self.manifest_path, variables)
+        self.depth_remaining = (
+            self.manifest.budgets.max_depth
+            if depth_remaining is None
+            else min(depth_remaining, self.manifest.budgets.max_depth)
+        )
+        self.allowed_mcp = allowed_mcp
+        self.allowed_effects = allowed_effects
+        self.require_http_mcp = require_http_mcp
+        self.mcp_http_timeout = mcp_http_timeout
 
         selected_agent = (
             coding_agent
@@ -207,6 +233,9 @@ class Kernel:
         head = self.checkpoint.current_rev()
         if resume and prior:
             print(f"RESUME: last accepted revision {prior[:8]}")
+            if self.manifest.state_policy.on_resume == "retain":
+                print("  retaining current workspace state by configured state_policy")
+                return prior
             if head != prior:
                 resume_phase = self._resume_point(announce=False)
                 if self._candidate_is_pending_followup(
@@ -289,11 +318,21 @@ class Kernel:
             "exit_reason": self.exit_reason or "completed",
             "ok": self.exit_reason == "",
         }
+        terminal = self._terminal_execution()
+        summary["terminal_phase"] = terminal.get("phase") if terminal else None
+        summary["terminal_status"] = terminal.get("status") if terminal else None
+        summary["terminal_result"] = terminal.get("result") if terminal else None
         print(f"\n{'=' * 68}")
         print(f"KERNEL finished: {summary['exit_reason']} "
               f"({summary['journal_entries']} journal entries)")
         print(f"{'=' * 68}\n")
         return summary
+
+    def _terminal_execution(self) -> dict[str, Any] | None:
+        for entry in reversed(self.journal.read_all()):
+            if entry.get("kind") in {"role", "workflow"}:
+                return entry
+        return None
 
     def _resume_discards_worktree(self) -> bool:
         """Is an interrupted session's uncommitted work debris, or a candidate?
@@ -402,11 +441,25 @@ class Kernel:
             return self._execute_human(phase)
         if phase.kind == "loop":
             return self._execute_loop(phase)
+        if phase.kind == "workflow":
+            return self._execute_workflow(phase)
         raise ManifestError(f"unsupported phase kind '{phase.kind}' in '{phase.name}'")
 
     def _execute_role(self, phase: PhaseConfig) -> dict[str, Any]:
         role = self.manifest.roles[phase.role or ""]
         attempt = self.journal.attempts_for_phase(phase.name) + 1
+        if self.allowed_mcp is not None:
+            denied = sorted(set(role.mcp) - self.allowed_mcp)
+            if denied:
+                errors = [
+                    f"role '{role.name}' requests MCP capability not granted by its "
+                    f"parent workflow: {', '.join(denied)}"
+                ]
+                self.journal.append(JournalEntry(
+                    run_id=self.run_id, phase=phase.name, kind="role", role=role.name,
+                    attempt=attempt, ok=False, verdict="capability_denied", errors=errors,
+                ))
+                return {"valid": False, "status": None, "errors": errors, "data": {}}
         skill_path = self._resolve_path(role.skill)
         if not skill_path.is_file():
             raise ManifestError(
@@ -437,6 +490,21 @@ class Kernel:
             self.kernel_data / "results"
             / f"{phase.name}_attempt{attempt}_{driver_kind}.json"
         )
+        session_options: dict[str, Any] = {}
+        if self.allowed_mcp is not None:
+            if not getattr(self.driver, "supports_explicit_mcp_config", False):
+                errors = [
+                    f"driver '{driver_kind}' cannot enforce a child MCP capability boundary"
+                ]
+                self.journal.append(JournalEntry(
+                    run_id=self.run_id, phase=phase.name, kind="role", role=role.name,
+                    attempt=attempt, ok=False, verdict="capability_unenforceable",
+                    errors=errors,
+                ))
+                return {"valid": False, "status": None, "errors": errors, "data": {}}
+            session_options["mcp_config"] = self._filtered_mcp_config(
+                phase, role, attempt
+            )
 
         while True:
             try:
@@ -449,6 +517,7 @@ class Kernel:
                     tools=role.tools,
                     result_file=result_file,
                     trace_file=trace_file,
+                    **session_options,
                 )
                 break
             except TokenLimitError as limit:
@@ -462,6 +531,10 @@ class Kernel:
         status, errors = self._read_contract(role, agent)
         candidate_rev = self.checkpoint.current_rev() if self.checkpoint else None
         valid = status is not None
+        archived_artifacts = self._write_attempt_receipt(
+            phase, attempt, status, errors, agent.result_json, agent.trace_path,
+            base_rev, candidate_rev,
+        )
 
         self.journal.append(JournalEntry(
             run_id=self.run_id, phase=phase.name, kind="role", role=role.name,
@@ -469,6 +542,7 @@ class Kernel:
             verdict=status or "contract_violation", status=status,
             item=self.current_item, errors=errors,
             result=agent.result_json, trace_path=agent.trace_path,
+            artifacts=archived_artifacts,
         ))
 
         print(f"    -> status={status or 'CONTRACT VIOLATION'}")
@@ -477,6 +551,126 @@ class Kernel:
 
         return {"valid": valid, "status": status, "errors": errors,
                 "data": agent.result_json or {}}
+
+    def _filtered_mcp_config(
+        self, phase: PhaseConfig, role: RoleConfig, attempt: int
+    ) -> Path:
+        source = self.workspace / ".mcp.json"
+        servers: dict[str, Any] = {}
+        if source.is_file():
+            payload = json.loads(source.read_text(encoding="utf-8"))
+            raw_servers = payload.get("mcpServers")
+            if not isinstance(raw_servers, dict):
+                raise ManifestError(f"MCP config must contain mcpServers: {source}")
+            missing = sorted(set(role.mcp) - set(raw_servers))
+            if missing:
+                raise ManifestError(
+                    f"role '{role.name}' requires MCP server(s) absent from {source}: "
+                    + ", ".join(missing)
+                )
+            servers = {name: raw_servers[name] for name in role.mcp}
+        elif role.mcp:
+            raise ManifestError(
+                f"role '{role.name}' requires MCP server(s) but {source} does not exist"
+            )
+        if self.require_http_mcp:
+            for name, server in servers.items():
+                if not isinstance(server, dict) or not isinstance(server.get("url"), str):
+                    raise ManifestError(
+                        f"MCP server '{name}' must declare an HTTP url for this child"
+                    )
+                self._require_http_reachable(name, server["url"])
+        output = (
+            self.kernel_data / "mcp" / f"{phase.name}-attempt-{attempt:04d}.json"
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(
+            json.dumps({"mcpServers": servers}, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        return output
+
+    def _require_http_reachable(self, name: str, url: str) -> None:
+        if not url.lower().startswith(("http://", "https://")):
+            raise ManifestError(f"MCP server '{name}' is not HTTP: {url}")
+        request = urllib.request.Request(url, method="OPTIONS")
+        try:
+            with urllib.request.urlopen(request, timeout=self.mcp_http_timeout):
+                return
+        except urllib.error.HTTPError:
+            # Any HTTP response proves that the configured process is reachable.
+            return
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            raise ManifestError(
+                f"MCP server '{name}' is not reachable at {url}: {exc}"
+            ) from exc
+
+    def _write_attempt_receipt(
+        self,
+        phase: PhaseConfig,
+        attempt: int,
+        status: str | None,
+        errors: list[str],
+        result: dict[str, Any] | None,
+        trace_path: str | None,
+        base_rev: str | None,
+        candidate_rev: str | None,
+    ) -> list[str]:
+        """Archive opt-in external attempt evidence outside the workspace."""
+        if self.manifest.state_policy.attempt_receipts != "files":
+            return []
+        root = self.kernel_data / "attempts" / phase.name / f"attempt-{attempt:04d}"
+        artifact_root = root / "artifacts"
+        copied: list[str] = []
+        candidates: list[str] = []
+        if isinstance(result, dict):
+            for key, value in result.items():
+                if key == "artifact" and isinstance(value, str):
+                    candidates.append(value)
+                elif key == "artifacts" and isinstance(value, list):
+                    candidates.extend(str(item) for item in value)
+                elif (key.endswith("_ref") or key.endswith("_refs")):
+                    if isinstance(value, str):
+                        candidates.append(value)
+                    elif isinstance(value, list):
+                        candidates.extend(str(item) for item in value)
+        seen: set[str] = set()
+        for raw in candidates:
+            if raw in seen or "#" in raw:
+                continue
+            seen.add(raw)
+            source = Path(raw)
+            if not source.is_absolute():
+                source = self.workspace / source
+            source = source.resolve()
+            if not source.is_file() or self.workspace not in source.parents:
+                continue
+            relative = source.relative_to(self.workspace)
+            destination = artifact_root / relative
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, destination)
+            copied.append(relative.as_posix())
+        root.mkdir(parents=True, exist_ok=True)
+        receipt = {
+            "run_id": self.run_id,
+            "task_id": self.task_id,
+            "phase": phase.name,
+            "attempt": attempt,
+            "status": status,
+            "ok": status is not None,
+            "errors": errors,
+            "result": result,
+            "trace_path": trace_path,
+            "base_revision": base_rev,
+            "candidate_revision": candidate_rev,
+            "retained_workspace": self.manifest.state_policy.on_retry == "retain",
+            "archived_artifacts": copied,
+        }
+        (root / "receipt.json").write_text(
+            json.dumps(receipt, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        return copied
 
     def _read_contract(
         self, role: RoleConfig, agent: AgentResult
@@ -630,6 +824,323 @@ class Kernel:
                 items.append(relative)
         return items
 
+    def _execute_workflow(self, phase: PhaseConfig) -> dict[str, Any]:
+        """Invoke one or more statically named children in fresh kernel runs."""
+        attempt = self.journal.attempts_for_phase(phase.name) + 1
+        limits = phase.limits
+        max_attempts = limits.max_attempts if limits else 1
+        if attempt > max_attempts:
+            errors = [
+                f"child phase '{phase.name}' reached its invocation limit of {max_attempts}"
+            ]
+            self.journal.append(JournalEntry(
+                run_id=self.run_id, phase=phase.name, kind="workflow",
+                attempt=attempt, ok=False, verdict="max_attempts", errors=errors,
+            ))
+            return {"valid": False, "status": None, "errors": errors, "data": {}}
+
+        decrement = limits.decrement_depth if limits else 1
+        remaining = self.depth_remaining - decrement
+        if limits and limits.max_depth is not None:
+            remaining = min(remaining, limits.max_depth)
+        declared = phase.child_result.statuses if phase.child_result else []
+        if remaining < 0:
+            status = "decomposition_limit" if "decomposition_limit" in declared else None
+            errors = [] if status else [
+                f"child phase '{phase.name}' exhausted its depth budget"
+            ]
+            self.journal.append(JournalEntry(
+                run_id=self.run_id, phase=phase.name, kind="workflow",
+                attempt=attempt, ok=status is not None,
+                verdict=status or "depth_exhausted", status=status, errors=errors,
+                result={"depth_remaining": self.depth_remaining, "decrement": decrement},
+            ))
+            return {
+                "valid": status is not None, "status": status, "errors": errors,
+                "data": {"depth_remaining": self.depth_remaining},
+            }
+
+        try:
+            items = self._child_items(phase)
+            receipts = [
+                self._run_child(phase, attempt, index, item, remaining)
+                for index, item in enumerate(items, start=1)
+            ]
+            errors = [
+                error for receipt in receipts for error in receipt.get("errors", [])
+            ]
+            statuses = [
+                str(receipt["status"]) for receipt in receipts if receipt.get("status")
+            ]
+            status = self._aggregate_child_status(phase, statuses)
+            valid = len(statuses) == len(receipts) and status in declared
+            if not valid and not errors:
+                errors = [
+                    f"child phase '{phase.name}' did not produce one declared status per child"
+                ]
+        except (ManifestError, OSError, ValueError, json.JSONDecodeError) as exc:
+            receipts = []
+            status = None
+            valid = False
+            errors = [f"{type(exc).__name__}: {exc}"]
+
+        result = {"children": receipts, "status": status}
+        artifacts = [
+            artifact for receipt in receipts for artifact in receipt.get("artifacts", [])
+        ]
+        self.journal.append(JournalEntry(
+            run_id=self.run_id, phase=phase.name, kind="workflow", attempt=attempt,
+            ok=valid, verdict=status or "invalid_child_result", status=status,
+            errors=errors, result=result, artifacts=artifacts,
+        ))
+        receipt_dir = self.kernel_data / "child-receipts" / phase.name
+        receipt_dir.mkdir(parents=True, exist_ok=True)
+        (receipt_dir / f"attempt-{attempt:04d}.json").write_text(
+            json.dumps(result | {"errors": errors, "valid": valid}, indent=2, default=str),
+            encoding="utf-8",
+        )
+        print(
+            f"\n>>> {phase.name}  workflow={phase.workflow}  attempt {attempt}"
+            f"\n    -> status={status or 'INVALID CHILD RESULT'} children={len(receipts)}"
+        )
+        return {"valid": valid, "status": status, "errors": errors, "data": result}
+
+    def _child_items(self, phase: PhaseConfig) -> list[Any | None]:
+        if phase.foreach is None:
+            return [None]
+        raw = load_reference(phase.foreach.source, self.workspace)
+        if not isinstance(raw, list):
+            raise ManifestError(
+                f"foreach source for '{phase.name}' must resolve to a list"
+            )
+        if len(raw) > phase.foreach.max_items:
+            raise ManifestError(
+                f"foreach source for '{phase.name}' has {len(raw)} items, above "
+                f"max_items={phase.foreach.max_items}"
+            )
+        stable_field = phase.foreach.stable_id
+        prefix = f"{phase.foreach.item}."
+        if stable_field.startswith(prefix):
+            stable_field = stable_field[len(prefix):]
+        return order_items(raw, stable_field, phase.foreach.order)
+
+    def _run_child(
+        self,
+        phase: PhaseConfig,
+        attempt: int,
+        index: int,
+        item: Any | None,
+        depth_remaining: int,
+    ) -> dict[str, Any]:
+        task = phase.task
+        result_contract = phase.child_result
+        if task is None or result_contract is None:
+            raise ManifestError(f"workflow phase '{phase.name}' has no child contract")
+        variables: dict[str, Any] = {}
+        stable_id = str(index)
+        if phase.foreach is not None:
+            variables[phase.foreach.item] = item
+            stable_field = phase.foreach.stable_id
+            prefix = f"{phase.foreach.item}."
+            if stable_field.startswith(prefix):
+                stable_field = stable_field[len(prefix):]
+            stable_id = str(dotted(item, stable_field))
+        configured_task_id = str(expand_runtime(task.id, variables))
+        child_task_id = f"{configured_task_id}.__attempt_{attempt:04d}"
+        if phase.foreach is not None:
+            child_task_id += f".__item_{self._safe_name(stable_id)}"
+        invocation = f"{self._safe_name(phase.name)}-{attempt:04d}-{index:04d}"
+        child_root = self.kernel_data / "children" / invocation
+        durable_receipt = child_root / "receipt.json"
+        if durable_receipt.is_file():
+            try:
+                cached = json.loads(durable_receipt.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                cached = None
+            if isinstance(cached, dict):
+                cached["reused"] = True
+                return cached
+        inputs = self._resolve_child_value(task.input, variables)
+        task_text = json.dumps(
+            {
+                "parent_task_id": self.task_id,
+                "parent_phase": phase.name,
+                "configured_task_id": configured_task_id,
+                "input": inputs,
+                "context": phase.context.__dict__ if phase.context else {},
+                "capabilities": phase.capabilities.__dict__ if phase.capabilities else {},
+            },
+            ensure_ascii=False,
+            indent=2,
+            default=str,
+        )
+        manifest = self._resolve_child_manifest(phase.workflow or "")
+        allowed_mcp, allowed_effects = self._child_capabilities(phase)
+        child_driver = self.driver
+        if (
+            phase.limits
+            and phase.limits.max_agent_requests is not None
+            and hasattr(self.driver, "max_turns")
+        ):
+            child_driver = copy(self.driver)
+            child_driver.max_turns = phase.limits.max_agent_requests
+        child = Kernel(
+            manifest_path=manifest,
+            workspace=self.workspace,
+            task_id=child_task_id,
+            task_text=task_text,
+            base_dir=self.base_dir,
+            coding_agent=getattr(child_driver, "kind", None),
+            kernel_data_root=child_root,
+            run_id="run",
+            resume=True,
+            driver=child_driver,
+            depth_remaining=depth_remaining,
+            allowed_mcp=allowed_mcp,
+            allowed_effects=allowed_effects,
+            require_http_mcp=(
+                phase.capabilities.require_http_reachable
+                if phase.capabilities else False
+            ),
+            mcp_http_timeout=(
+                phase.capabilities.http_timeout_seconds
+                if phase.capabilities else 5.0
+            ),
+        )
+        summary = child.run()
+        raw_status: Any = summary.get("terminal_status")
+        if result_contract.status_from:
+            raw_status = load_reference(result_contract.status_from, child.task_dir)
+        if raw_status is None:
+            raw_status = result_contract.default_status or None
+        status = result_contract.status_map.get(str(raw_status), str(raw_status)) \
+            if raw_status is not None else None
+        errors: list[str] = []
+        if status not in result_contract.statuses:
+            errors.append(
+                f"child '{phase.workflow}' returned '{raw_status}', which maps to "
+                f"'{status}' but declared statuses are {result_contract.statuses}"
+            )
+            status = None
+        artifacts: list[str] = []
+        workspace_cfg = phase.workspace
+        if workspace_cfg and workspace_cfg.merge == "artifacts_only":
+            artifacts = copy_declared_artifacts(
+                child.task_dir,
+                self.task_dir,
+                str(expand_runtime(workspace_cfg.artifact_prefix, variables)),
+                result_contract.artifacts,
+                attempt,
+            )
+        receipt = {
+            "invocation": invocation,
+            "workflow": phase.workflow,
+            "configured_task_id": configured_task_id,
+            "task_id": child_task_id,
+            "item_id": stable_id if phase.foreach else None,
+            "status": status,
+            "raw_status": raw_status,
+            "ok": status is not None,
+            "errors": errors,
+            "artifacts": artifacts,
+            "journal": summary.get("journal"),
+            "exit_reason": summary.get("exit_reason"),
+            "depth_remaining": depth_remaining,
+            "capabilities": {
+                "mcp": sorted(allowed_mcp) if allowed_mcp is not None else None,
+                "effects": sorted(allowed_effects) if allowed_effects is not None else None,
+            },
+        }
+        child_root.mkdir(parents=True, exist_ok=True)
+        temporary = child_root / "receipt.json.tmp"
+        temporary.write_text(
+            json.dumps(receipt, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        temporary.replace(durable_receipt)
+        return receipt
+
+    def _resolve_child_value(self, value: Any, variables: dict[str, Any]) -> Any:
+        expanded = expand_runtime(value, variables)
+        if isinstance(expanded, list):
+            return [self._resolve_child_value(item, variables) for item in expanded]
+        if not isinstance(expanded, dict):
+            return expanded
+        if "from" in expanded:
+            reference = str(expanded["from"])
+            try:
+                return load_reference(reference, self.workspace)
+            except ManifestError:
+                if expanded.get("required", True):
+                    raise
+                return None
+        if "from_child" in expanded:
+            source = str(expanded["from_child"])
+            for entry in reversed(self.journal.read_all()):
+                if entry.get("kind") == "workflow" and entry.get("phase") == source:
+                    return entry.get("result")
+            raise ManifestError(f"no completed child result exists for phase '{source}'")
+        return {
+            key: self._resolve_child_value(item, variables)
+            for key, item in expanded.items()
+        }
+
+    def _aggregate_child_status(self, phase: PhaseConfig, statuses: list[str]) -> str | None:
+        if not statuses:
+            return None
+        if len(set(statuses)) == 1:
+            return statuses[0]
+        contract = phase.child_result
+        if contract is None:
+            return None
+        if not contract.aggregate:
+            return contract.default_status or None
+        priority = contract.status_priority or [
+            status for status in contract.statuses if status != "completed"
+        ]
+        for status in priority:
+            if status in statuses:
+                return status
+        return "completed" if "completed" in contract.statuses else statuses[0]
+
+    def _resolve_child_manifest(self, name: str) -> Path:
+        candidate = Path(name)
+        choices = [candidate] if candidate.is_absolute() else [
+            self.base_dir / "workflows" / name / f"{name}.workflow.md",
+            self.base_dir / "workflows" / f"{name}.workflow.md",
+        ]
+        for choice in choices:
+            if choice.is_file():
+                return choice.resolve()
+        raise ManifestError(
+            f"child workflow '{name}' was not found; checked: "
+            + ", ".join(str(choice) for choice in choices)
+        )
+
+    def _child_capabilities(
+        self, phase: PhaseConfig
+    ) -> tuple[set[str] | None, set[str] | None]:
+        config = phase.capabilities
+        if config is None or config.inherit:
+            return self.allowed_mcp, self.allowed_effects
+        requested_mcp = set(config.allow_mcp)
+        requested_effects = set(config.allow_effects)
+        if self.allowed_mcp is not None and not requested_mcp <= self.allowed_mcp:
+            raise ManifestError(
+                f"child phase '{phase.name}' requests MCP outside its parent grant: "
+                + ", ".join(sorted(requested_mcp - self.allowed_mcp))
+            )
+        if self.allowed_effects is not None and not requested_effects <= self.allowed_effects:
+            raise ManifestError(
+                f"child phase '{phase.name}' requests effects outside its parent grant: "
+                + ", ".join(sorted(requested_effects - self.allowed_effects))
+            )
+        return requested_mcp, requested_effects
+
+    @staticmethod
+    def _safe_name(value: str) -> str:
+        return re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-._") or "child"
+
     # --------------------------------------------------------------- routing
 
     def _route(self, phase: PhaseConfig, result: dict[str, Any]) -> str | None:
@@ -643,7 +1154,7 @@ class Kernel:
         if phase.kind == "human":
             return phase.next
 
-        if phase.kind == "role":
+        if phase.kind in {"role", "workflow"}:
             if result["valid"]:
                 status = result["status"]
                 if status is not None and status in phase.on_status:
@@ -680,7 +1191,7 @@ class Kernel:
         if action == "route_to":
             return target
 
-        if action in {"stop", "stop_subtree", "fail"}:
+        if action in {"stop", "stop_subtree", "stop_with_failure", "fail"}:
             self.exit_reason = f"{phase.name}: {action}"
             self.journal.append(JournalEntry(
                 run_id=self.run_id, phase=phase.name, kind="escalate", ok=False,
@@ -688,7 +1199,7 @@ class Kernel:
             ))
             return None
 
-        if action != "retry_with_feedback":
+        if action not in {"retry_with_feedback", "retry_child_clean"}:
             self.exit_reason = f"{phase.name}: unknown failure action '{action}'"
             return None
 
@@ -698,7 +1209,9 @@ class Kernel:
             self.exit_reason = (
                 f"{target}: {attempts} attempts reached the declared limit of {max_attempts}"
             )
-            parked = self._park(target, attempts)
+            parked = ""
+            if self.manifest.state_policy.on_exhaustion == "park_and_restore":
+                parked = self._park(target, attempts)
             self.journal.append(JournalEntry(
                 run_id=self.run_id, phase=target, kind="escalate", ok=False,
                 verdict="max_attempts", candidate_rev=parked,
@@ -708,11 +1221,30 @@ class Kernel:
             return None
 
         self._remember_failures(target, phase.name, result)
-        preserved_candidate = bool(config.get("preserve_candidate", False))
-        reset = self._revert(
-            phase.name, target, preserve_candidate=preserved_candidate
+        workspace_action = str(config.get("workspace_action", ""))
+        if action == "retry_child_clean":
+            workspace_action = "retain"
+        if not workspace_action:
+            workspace_action = self.manifest.state_policy.on_retry
+        if bool(config.get("preserve_candidate", False)):
+            workspace_action = "preserve_candidate"
+        reset = False
+        if workspace_action in {"restore", "preserve_candidate"}:
+            reset = self._revert(
+                phase.name,
+                target,
+                preserve_candidate=workspace_action == "preserve_candidate",
+            )
+        elif workspace_action != "retain":
+            self.exit_reason = (
+                f"{phase.name}: unknown failure workspace_action '{workspace_action}'"
+            )
+            return None
+        self.pending_feedback = self._feedback(
+            target,
+            reset=reset,
+            retained_workspace=workspace_action == "retain",
         )
-        self.pending_feedback = self._feedback(target, reset=reset)
         return target
 
     def _resolve_target(self, phase: PhaseConfig, target: str | None) -> PhaseConfig | None:
@@ -777,10 +1309,24 @@ class Kernel:
             item=self.current_item,
         ))
 
-    def _feedback(self, target: str, *, reset: bool = True) -> str | None:
+    def _feedback(
+        self,
+        target: str,
+        *,
+        reset: bool | None = None,
+        retained_workspace: bool | None = None,
+    ) -> str | None:
+        if self.manifest.state_policy.feedback == "none":
+            return None
         errors = self.journal.active_failure_causes(target)
+        if self.manifest.state_policy.feedback == "latest" and errors:
+            errors = errors[-1:]
         if not errors:
             return None
+        if retained_workspace is None:
+            retained_workspace = self.manifest.state_policy.on_retry == "retain"
+        if reset is None:
+            reset = not retained_workspace
         lines = [
             f"Earlier attempts routed back to the '{target}' step.",
             "",
@@ -794,6 +1340,12 @@ class Kernel:
                 "The repository has been reset to the last accepted commit, so none of",
                 "your previous changes are present. Start from the current state, fix",
                 "the cause of these problems, and do not repeat the same approach.",
+            ]
+        elif retained_workspace:
+            lines += [
+                "Previous files and external-world effects were retained. Treat them as",
+                "evidence, observe the current state again, and make a new plan from what",
+                "is true now. Do not assume that a failed attempt made no progress.",
             ]
         else:
             lines += [
@@ -844,6 +1396,8 @@ class Kernel:
         The leftovers are parked on a branch first, so nothing is destroyed and
         the diff stays readable, and only then discarded from the tree.
         """
+        if self.manifest.state_policy.before_role == "retain":
+            return
         if self.checkpoint is None or not self.checkpoint.is_dirty():
             return
         head_before_settle = self.checkpoint.current_rev()
