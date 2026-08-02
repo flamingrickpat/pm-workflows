@@ -1108,6 +1108,8 @@ class Kernel:
         choices = [candidate] if candidate.is_absolute() else [
             self.base_dir / "workflows" / name / f"{name}.workflow.md",
             self.base_dir / "workflows" / f"{name}.workflow.md",
+            self.base_dir / name / f"{name}.workflow.md",
+            self.base_dir / f"{name}.workflow.md",
         ]
         for choice in choices:
             if choice.is_file():

@@ -171,6 +171,24 @@ def test_child_workflow_maps_terminal_status_and_writes_receipt(tmp_path: Path) 
     assert (kernel.kernel_data / "child-receipts" / "child" / "attempt-0001.json").is_file()
 
 
+def test_child_manifest_resolves_when_base_is_the_workflow_root(tmp_path: Path) -> None:
+    base = tmp_path / "library"
+    parent = _write_child_workflows(base)
+    workflow_root = base / "workflows"
+    kernel = Kernel(
+        parent,
+        tmp_path / "repo",
+        "parent-root-layout",
+        base_dir=workflow_root,
+        kernel_data_root=tmp_path / "kernel",
+        driver=StubDriver([{"status": "pass", "artifact": "result.md"}]),
+    )
+
+    resolved = kernel._resolve_child_manifest("leaf")
+
+    assert resolved == (workflow_root / "leaf" / "leaf.workflow.md").resolve()
+
+
 def test_completed_child_invocation_is_reused_after_parent_crash_window(
     tmp_path: Path,
 ) -> None:
