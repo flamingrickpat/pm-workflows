@@ -9,6 +9,7 @@ from .drivers import (
     MinimalAgentDriver,
     PmCoderDriver,
     PiDriver,
+    PythonDriver,
     SUPPORTED_DRIVERS,
     build_driver,
 )
@@ -21,6 +22,7 @@ __all__ = [
     "MinimalAgentDriver",
     "PmCoderDriver",
     "PiDriver",
+    "PythonDriver",
     "SUPPORTED_DRIVERS",
     "build_driver",
     "extract_json",

@@ -9,11 +9,13 @@ from pm_workflows.drivers import (
     CodexDriver,
     MinimalAgentDriver,
     PiDriver,
+    PythonDriver,
     build_driver,
 )
 from pm_workflows.drivers.common import CommandOutcome
 from pm_workflows.drivers import common
 from pm_workflows.manifest import parse_workflow
+from pm_workflows.python_role import RoleContext
 
 
 def test_factory_has_one_driver_per_supported_agent() -> None:
@@ -21,6 +23,7 @@ def test_factory_has_one_driver_per_supported_agent() -> None:
     assert isinstance(build_driver("codex"), CodexDriver)
     assert isinstance(build_driver("pi"), PiDriver)
     assert isinstance(build_driver("minimal_agent"), MinimalAgentDriver)
+    assert isinstance(build_driver("python"), PythonDriver)
 
 
 def test_codex_uses_exec_stdin_and_last_message(
@@ -191,6 +194,87 @@ def test_pm_coder_preserves_full_exception_diagnostics(
     assert event["exception_type"] == "RuntimeError"
     assert event["exception_message"] == "diagnostic test failure"
     assert "RuntimeError: diagnostic test failure" in event["exception_traceback"]
+
+
+def _context(work: Path, **overrides) -> RoleContext:
+    fields = dict(
+        run_id="run_attempt1", task_id="T-1", attempt=1, workspace=work,
+        task_dir=work, base_dir=work, kernel_data=work, role="worker",
+        phase="work", prompt="do it", task_text="do it", current_item=None,
+        feedback=None, answer=None,
+    )
+    fields.update(overrides)
+    return RoleContext(**fields)
+
+
+def test_python_driver_calls_the_entry_point_with_context(tmp_path: Path) -> None:
+    skill = tmp_path / "role.py"
+    skill.write_text(
+        "def run(context):\n"
+        "    return {'status': 'done', 'seen_task_id': context.task_id}\n",
+        encoding="utf-8",
+    )
+    result = PythonDriver().run_session(
+        "run", 1, str(skill), "do it", tmp_path,
+        context=_context(tmp_path, task_id="T-42"),
+    )
+    assert result.ok
+    assert result.result_json == {"status": "done", "seen_task_id": "T-42"}
+
+
+def test_python_driver_reports_an_uncaught_exception_as_a_contract_violation(
+    tmp_path: Path,
+) -> None:
+    skill = tmp_path / "role.py"
+    skill.write_text(
+        "def run(context):\n"
+        "    raise RuntimeError('boom')\n",
+        encoding="utf-8",
+    )
+    result = PythonDriver().run_session(
+        "run", 1, str(skill), "do it", tmp_path, context=_context(tmp_path)
+    )
+    assert not result.ok
+    assert result.result_json is None
+    assert "RuntimeError: boom" in result.error
+
+
+def test_python_driver_requires_a_callable_run_entry_point(tmp_path: Path) -> None:
+    skill = tmp_path / "role.py"
+    skill.write_text("run = 'not callable'\n", encoding="utf-8")
+    result = PythonDriver().run_session(
+        "run", 1, str(skill), "do it", tmp_path, context=_context(tmp_path)
+    )
+    assert not result.ok
+    assert "no callable 'run(context)' entry point" in result.error
+
+
+def test_python_driver_rejects_a_non_dict_return_value(tmp_path: Path) -> None:
+    skill = tmp_path / "role.py"
+    skill.write_text("def run(context):\n    return 'done'\n", encoding="utf-8")
+    result = PythonDriver().run_session(
+        "run", 1, str(skill), "do it", tmp_path, context=_context(tmp_path)
+    )
+    assert not result.ok
+    assert "expected a dict result object" in result.error
+
+
+def test_python_driver_writes_trace_and_result_artifacts(tmp_path: Path) -> None:
+    skill = tmp_path / "role.py"
+    skill.write_text(
+        "def run(context):\n    return {'status': 'done'}\n", encoding="utf-8"
+    )
+    trace = tmp_path / "trace.jsonl"
+    result_file = tmp_path / "result.json"
+    result = PythonDriver().run_session(
+        "run", 1, str(skill), "do it", tmp_path,
+        result_file=result_file, trace_file=trace, context=_context(tmp_path),
+    )
+    assert result.result_json == {"status": "done"}
+    events = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines()]
+    assert events[0]["event"] == "start"
+    assert events[-1]["event"] == "end"
+    assert json.loads(result_file.read_text(encoding="utf-8"))["result"] == {"status": "done"}
 
 
 def test_shipped_workflows_are_agent_neutral() -> None:

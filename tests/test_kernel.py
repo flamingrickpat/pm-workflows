@@ -744,6 +744,145 @@ def test_many_work_items_do_not_trip_the_top_level_phase_budget(tmp_path: Path) 
     assert driver.calls == 7
 
 
+ITEM_SCOPED_RETRY = """\
+---
+name: t
+driver: {kind: claude, model: sonnet}
+checkpoint_backend: {kind: git, repo_path: "${TARGET}"}
+human_resolver: {mode: forbid}
+roles:
+  worker:
+    skill: skills/x/SKILL.md
+    result_contract:
+      type: json
+      schema:
+        status: {enum: [item_done]}
+phases:
+  - name: items
+    kind: loop
+    iterator_source: pending_work_items
+    exit: finish
+    body:
+      - name: do_item
+        kind: role
+        role: worker
+        checkpoint_after: true
+        on_status:
+          item_done: next_item
+        on_invalid: {action: retry_with_feedback, target: do_item, max_attempts: 2}
+  - name: finish
+    kind: script
+    script: scripts/check.py
+---
+"""
+
+
+def test_on_invalid_max_attempts_resets_for_each_work_item(tmp_path: Path) -> None:
+    """A hard item's retries must not eat into the next item's attempt budget.
+
+    Both items here fail their first attempt and succeed on their second, so
+    each individually stays within max_attempts: 2. Before attempt counting
+    was scoped to the loop item, the second item's first (failing) attempt
+    would already read as the task's third attempt on this phase — over the
+    declared cap of 2 — and the run would give up on it without ever retrying.
+    """
+    repo = make_repo(tmp_path)
+    _work_items(repo, "WI-01-first.md", "WI-02-second.md")
+    base = make_base(tmp_path, ITEM_SCOPED_RETRY, {"check.py": PASSING_CHECK})
+    driver = StubDriver([
+        "not json", {"status": "item_done"},
+        "not json", {"status": "item_done"},
+    ])
+
+    result = run_kernel(base, repo, driver, tmp_path)
+
+    assert result["ok"], result["exit_reason"]
+    assert driver.calls == 4
+    completed = [
+        Path(entry["item"]).name for entry in _journal(tmp_path)
+        if entry["kind"] == "item_complete"
+    ]
+    assert completed == ["WI-01-first.md", "WI-02-second.md"]
+    attempts_by_item = [
+        (Path(entry["item"]).name, entry["attempt"])
+        for entry in _journal(tmp_path) if entry.get("kind") == "role"
+    ]
+    assert attempts_by_item == [
+        ("WI-01-first.md", 1), ("WI-01-first.md", 2),
+        ("WI-02-second.md", 1), ("WI-02-second.md", 2),
+    ]
+
+
+def test_trace_and_result_artifacts_do_not_collide_across_work_items(tmp_path: Path) -> None:
+    """Attempt numbers reset per item, so paths keyed only on phase+attempt
+    would otherwise have the second item silently overwrite the first item's
+    trace and result artifacts."""
+
+    class RecordingDriver:
+        """A driver that records the paths the kernel handed it, like a real
+        one would receive them, without depending on any real driver's own
+        file-writing behaviour."""
+
+        def __init__(self, results: list[dict]) -> None:
+            self.results = list(results)
+            self.seen_paths: list[tuple[Path | None, Path | None]] = []
+
+        def run_session(self, run_id, attempt, skill, prompt, work_dir, tools=None,
+                        result_file=None, trace_file=None) -> AgentResult:
+            self.seen_paths.append((result_file, trace_file))
+            payload = self.results.pop(0)
+            return AgentResult(exit_code=0, stdout=json.dumps(payload), result_json=payload)
+
+    repo = make_repo(tmp_path)
+    _work_items(repo, "WI-01-first.md", "WI-02-second.md")
+    base = make_base(tmp_path, ITEM_SCOPED_RETRY, {"check.py": PASSING_CHECK})
+    driver = RecordingDriver([{"status": "item_done"}, {"status": "item_done"}])
+
+    result = run_kernel(base, repo, driver, tmp_path)
+
+    assert result["ok"], result["exit_reason"]
+    assert len(driver.seen_paths) == 2
+    result_files = [str(rf) for rf, _ in driver.seen_paths]
+    trace_files = [str(tf) for _, tf in driver.seen_paths]
+    assert len(set(result_files)) == 2, result_files
+    assert len(set(trace_files)) == 2, trace_files
+
+
+def test_park_ref_names_include_the_item_so_different_items_never_collide(
+    tmp_path: Path,
+) -> None:
+    """`_park` is reached with an attempt number that resets per item; the item
+    must be folded into the branch name or two items exhausting at the same
+    local attempt would silently retarget one branch onto the other's commit."""
+    repo = make_repo(tmp_path)
+    base = make_base(tmp_path, ITEM_SCOPED_RETRY, {"check.py": PASSING_CHECK})
+    kernel = Kernel(
+        manifest_path=base / "coding" / "w.workflow.md",
+        workspace=repo, task_id=TASK_ID, task_text="t", base_dir=base,
+        kernel_data_root=tmp_path / "kernel_data",
+        driver=StubDriver([]),
+    )
+
+    (repo / "product.txt").write_text("item one's rejected attempt\n", encoding="utf-8")
+    ref1 = f"do_item-{kernel._safe_name(Path('WI-01-first.md').name)}-2"
+    kernel._park("do_item", 2, item="agents/tasks/T-1/workitems/WI-01-first.md")
+
+    (repo / "product.txt").write_text("item two's rejected attempt\n", encoding="utf-8")
+    ref2 = f"do_item-{kernel._safe_name(Path('WI-02-second.md').name)}-2"
+    kernel._park("do_item", 2, item="agents/tasks/T-1/workitems/WI-02-second.md")
+
+    assert ref1 != ref2
+    branches = git(repo, "branch", "--list", "rejected/*")
+    assert f"rejected/{TASK_ID}/{ref1}" in branches
+    assert f"rejected/{TASK_ID}/{ref2}" in branches
+    assert git(
+        repo, "show", f"rejected/{TASK_ID}/{ref1}:product.txt"
+    ) == "item one's rejected attempt"
+    assert git(
+        repo, "show", f"rejected/{TASK_ID}/{ref2}:product.txt"
+    ) == "item two's rejected attempt"
+
+
 BLOCKING = """\
 ---
 name: t

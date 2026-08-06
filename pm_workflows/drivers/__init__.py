@@ -5,6 +5,7 @@ from .codex import CodexDriver
 from .factory import SUPPORTED_DRIVERS, build_driver
 from .minimal_agent import MinimalAgentDriver, PmCoderDriver
 from .pi import PiDriver
+from .python_driver import PythonDriver
 
 __all__ = [
     "AgentDriver",
@@ -13,6 +14,7 @@ __all__ = [
     "MinimalAgentDriver",
     "PmCoderDriver",
     "PiDriver",
+    "PythonDriver",
     "SUPPORTED_DRIVERS",
     "build_driver",
 ]

@@ -11,12 +11,14 @@ from .drivers import (
     MinimalAgentDriver,
     PmCoderDriver,
     PiDriver,
+    PythonDriver,
     build_driver,
 )
 from .journal import Journal
 from .kernel import Kernel
 from .manifest import ManifestError, StatePolicyConfig, Workflow, parse_workflow
 from .protocol import AgentResult, GateResult, JournalEntry, PhaseConfig, RoleConfig
+from .python_role import RoleContext
 
 __all__ = [
     "AgentResult",
@@ -32,7 +34,9 @@ __all__ = [
     "PmCoderDriver",
     "PiDriver",
     "PhaseConfig",
+    "PythonDriver",
     "RoleConfig",
+    "RoleContext",
     "StatePolicyConfig",
     "Workflow",
     "build_driver",

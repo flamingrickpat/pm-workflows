@@ -6,8 +6,9 @@ from .claude import ClaudeDriver
 from .codex import CodexDriver
 from .minimal_agent import PmCoderDriver
 from .pi import PiDriver
+from .python_driver import PythonDriver
 
-SUPPORTED_DRIVERS = ("claude", "codex", "pi", "pm-coder", "minimal_agent")
+SUPPORTED_DRIVERS = ("claude", "codex", "pi", "pm-coder", "minimal_agent", "python")
 
 
 def build_driver(
@@ -49,5 +50,7 @@ def build_driver(
             max_turns=max_agent_requests or 80,
             timeout_seconds=timeout_seconds,
         )
+    if kind == "python":
+        return PythonDriver()
     supported = ", ".join(SUPPORTED_DRIVERS)
     raise ValueError(f"unknown agent '{kind}'; choose one of: {supported}")

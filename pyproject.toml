@@ -21,6 +21,7 @@ dev = [
 
 [project.scripts]
 pm-workflows = "pm_workflows.execute_workflow:main"
+pm-workflow-check = "pm_workflows.dryrun:main"
 
 [tool.setuptools.packages.find]
 include = ["pm_workflows*"]

@@ -55,8 +55,20 @@ class Journal:
             if entry.get("phase") == phase and entry.get("kind") in EXECUTION_KINDS
         ]
 
-    def attempts_for_phase(self, phase: str) -> int:
-        return len(self.entries_for_phase(phase))
+    def attempts_for_phase(self, phase: str, item: str | None = None) -> int:
+        """Executions of `phase`, or only those for one loop item when given.
+
+        A phase that runs once per task (never inside a loop) is counted
+        globally: pass no `item`. A phase inside a loop runs once per work
+        item, and each item's attempts are its own budget — pass the current
+        item so a hard-to-implement item cannot consume the attempts a later
+        item needs, and so a later item does not inherit an earlier item's
+        count.
+        """
+        entries = self.entries_for_phase(phase)
+        if item is not None:
+            entries = [entry for entry in entries if entry.get("item") == item]
+        return len(entries)
 
     def last_route(self) -> dict | None:
         for entry in reversed(self.read_all()):

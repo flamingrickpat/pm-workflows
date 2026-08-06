@@ -35,6 +35,7 @@ from .child import (
     order_items,
 )
 from .drivers import build_driver
+from .drivers.python_driver import PythonDriver
 from .gates import run_gate
 from .journal import Journal
 from .manifest import ManifestError, Workflow, parse_workflow
@@ -47,6 +48,7 @@ from .protocol import (
     PhaseConfig,
     RoleConfig,
 )
+from .python_role import RoleContext
 from .ratelimit import TokenLimitError
 
 WORK_ITEM_GLOB = "WI-*.md"
@@ -153,6 +155,10 @@ class Kernel:
             )
         except ValueError as exc:
             raise ManifestError(str(exc)) from exc
+        # A role whose skill is a `.py` file always runs in-process, regardless
+        # of which coding agent the workflow is configured to use for its
+        # other roles.
+        self._python_driver = PythonDriver()
 
         journal_path = self.kernel_data / "journal.jsonl"
         if not resume and journal_path.is_file() and journal_path.stat().st_size:
@@ -294,7 +300,10 @@ class Kernel:
             # before its checks run would make the revert target the very
             # attempt the checks are about to reject.
             if result["valid"] and phase.checkpoint_after:
-                self._accept(phase.name, self.journal.attempts_for_phase(phase.name))
+                self._accept(
+                    phase.name,
+                    self.journal.attempts_for_phase(phase.name, item=self._item_scope(phase.name)),
+                )
             self._render_state_md(phase.name)
             target = self._route(phase, result)
             self.journal.append(JournalEntry(
@@ -367,10 +376,7 @@ class Kernel:
         loop = self.manifest.loop_containing(phase.name)
         if loop is not None:
             limit = loop.max_iterations
-            executed = sum(
-                1 for entry in self.journal.entries_for_phase(phase.name)
-                if entry.get("item") == self.current_item
-            )
+            executed = self.journal.attempts_for_phase(phase.name, item=self.current_item)
             scope = f"for {Path(self.current_item).name}" if self.current_item else ""
             setting = f"loop '{loop.name}' max_iterations"
         else:
@@ -393,6 +399,28 @@ class Kernel:
             reason_codes=[f"executed={executed}", f"limit={limit}"],
         ))
         return True
+
+    def _item_scope(self, phase_name: str) -> str | None:
+        """The work item that scopes attempt counting for `phase_name`.
+
+        A phase inside a loop runs once per work item, so its attempts reset
+        with each new item — the counter must not carry a hard item's retries
+        into the next item's budget. A phase that runs once per task has no
+        item to scope by, so its count stays the lifetime total it always was.
+        """
+        if self.manifest.loop_containing(phase_name) is not None:
+            return self.current_item
+        return None
+
+    def _item_tag(self, phase_name: str) -> str:
+        """Filesystem-safe suffix disambiguating a loop item's on-disk artifacts.
+
+        Attempt numbers reset per loop item, so any path keyed only by phase
+        name and attempt number collides between two items that each reach the
+        same local attempt count. This folds the item back in.
+        """
+        item = self._item_scope(phase_name)
+        return f"_{self._safe_name(Path(item).name)}" if item else ""
 
     def _resume_point(self, announce: bool = True) -> PhaseConfig | None:
         """Continue where the previous run left off, or start at the top.
@@ -448,7 +476,7 @@ class Kernel:
 
     def _execute_role(self, phase: PhaseConfig) -> dict[str, Any]:
         role = self.manifest.roles[phase.role or ""]
-        attempt = self.journal.attempts_for_phase(phase.name) + 1
+        attempt = self.journal.attempts_for_phase(phase.name, item=self._item_scope(phase.name)) + 1
         if self.allowed_mcp is not None:
             denied = sorted(set(role.mcp) - self.allowed_mcp)
             if denied:
@@ -482,18 +510,31 @@ class Kernel:
 
         prompt = self._build_prompt(role, phase, attempt, feedback, answer, skill_path)
         base_rev = self.checkpoint.current_rev() if self.checkpoint else None
-        driver_kind = getattr(self.driver, "kind", "agent")
+        driver = self._driver_for_skill(skill_path)
+        driver_kind = getattr(driver, "kind", "agent")
+        item_tag = self._item_tag(phase.name)
+        role_run_id = f"{self.run_id}_{phase.name}{item_tag}_attempt{attempt}"
         trace_file = (
             self.kernel_data / "traces"
-            / f"{phase.name}_attempt{attempt}_{driver_kind}.jsonl"
+            / f"{phase.name}{item_tag}_attempt{attempt}_{driver_kind}.jsonl"
         )
         result_file = (
             self.kernel_data / "results"
-            / f"{phase.name}_attempt{attempt}_{driver_kind}.json"
+            / f"{phase.name}{item_tag}_attempt{attempt}_{driver_kind}.json"
         )
         session_options: dict[str, Any] = {}
+        if isinstance(driver, PythonDriver):
+            session_options["context"] = RoleContext(
+                run_id=role_run_id,
+                task_id=self.task_id, attempt=attempt, workspace=self.workspace,
+                task_dir=self.task_dir, base_dir=self.base_dir,
+                kernel_data=self.kernel_data, role=role.name, phase=phase.name,
+                prompt=prompt, task_text=self.task_text,
+                current_item=self.current_item, feedback=feedback, answer=answer,
+                tools=list(role.tools), result_file=result_file, trace_file=trace_file,
+            )
         if self.allowed_mcp is not None:
-            if not getattr(self.driver, "supports_explicit_mcp_config", False):
+            if not getattr(driver, "supports_explicit_mcp_config", False):
                 errors = [
                     f"driver '{driver_kind}' cannot enforce a child MCP capability boundary"
                 ]
@@ -509,8 +550,8 @@ class Kernel:
 
         while True:
             try:
-                agent = self.driver.run_session(
-                    run_id=f"{self.run_id}_{phase.name}_attempt{attempt}",
+                agent = driver.run_session(
+                    run_id=role_run_id,
                     attempt=attempt,
                     skill=str(skill_path),
                     prompt=prompt,
@@ -553,6 +594,12 @@ class Kernel:
         return {"valid": valid, "status": status, "errors": errors,
                 "data": agent.result_json or {}}
 
+    def _driver_for_skill(self, skill_path: Path) -> Any:
+        """A `.py` skill always runs in-process, whatever the workflow's agent."""
+        if skill_path.suffix == ".py":
+            return self._python_driver
+        return self.driver
+
     def _filtered_mcp_config(
         self, phase: PhaseConfig, role: RoleConfig, attempt: int
     ) -> Path:
@@ -582,7 +629,8 @@ class Kernel:
                     )
                 self._require_http_reachable(name, server["url"])
         output = (
-            self.kernel_data / "mcp" / f"{phase.name}-attempt-{attempt:04d}.json"
+            self.kernel_data / "mcp"
+            / f"{phase.name}{self._item_tag(phase.name)}-attempt-{attempt:04d}.json"
         )
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(
@@ -620,7 +668,10 @@ class Kernel:
         """Archive opt-in external attempt evidence outside the workspace."""
         if self.manifest.state_policy.attempt_receipts != "files":
             return []
-        root = self.kernel_data / "attempts" / phase.name / f"attempt-{attempt:04d}"
+        root = (
+            self.kernel_data / "attempts" / phase.name
+            / f"attempt-{attempt:04d}{self._item_tag(phase.name)}"
+        )
         artifact_root = root / "artifacts"
         copied: list[str] = []
         candidates: list[str] = []
@@ -827,7 +878,7 @@ class Kernel:
 
     def _execute_workflow(self, phase: PhaseConfig) -> dict[str, Any]:
         """Invoke one or more statically named children in fresh kernel runs."""
-        attempt = self.journal.attempts_for_phase(phase.name) + 1
+        attempt = self.journal.attempts_for_phase(phase.name, item=self._item_scope(phase.name)) + 1
         limits = phase.limits
         max_attempts = limits.max_attempts if limits else 1
         if attempt > max_attempts:
@@ -896,7 +947,7 @@ class Kernel:
         ))
         receipt_dir = self.kernel_data / "child-receipts" / phase.name
         receipt_dir.mkdir(parents=True, exist_ok=True)
-        (receipt_dir / f"attempt-{attempt:04d}.json").write_text(
+        (receipt_dir / f"attempt-{attempt:04d}{self._item_tag(phase.name)}.json").write_text(
             json.dumps(result | {"errors": errors, "valid": valid}, indent=2, default=str),
             encoding="utf-8",
         )
@@ -947,13 +998,22 @@ class Kernel:
                 stable_field = stable_field[len(prefix):]
             stable_id = str(dotted(item, stable_field))
         configured_task_id = str(expand_runtime(task.id, variables))
+        outer_item = self._item_scope(phase.name)
+        if outer_item:
+            # `attempt` (below) resets per outer loop item, so a `task.id`
+            # template that does not itself vary per item would otherwise
+            # collide between two items' first attempt at this same phase.
+            configured_task_id = f"{configured_task_id}.{self._safe_name(Path(outer_item).name)}"
         child_task_id = self._child_task_id(
             self.workspace / "agents" / "tasks",
             configured_task_id,
             attempt,
             stable_id if phase.foreach is not None else None,
         )
-        invocation = f"{self._safe_name(phase.name)}-{attempt:04d}-{index:04d}"
+        invocation = (
+            f"{self._safe_name(phase.name)}{self._item_tag(phase.name)}"
+            f"-{attempt:04d}-{index:04d}"
+        )
         child_root = self.kernel_data / "children" / invocation
         durable_receipt = child_root / "receipt.json"
         if durable_receipt.is_file():
@@ -1233,14 +1293,14 @@ class Kernel:
             return None
 
         max_attempts = config.get("max_attempts", 999)
-        attempts = self.journal.attempts_for_phase(target)
+        attempts = self.journal.attempts_for_phase(target, item=self._item_scope(target))
         if attempts >= max_attempts:
             self.exit_reason = (
                 f"{target}: {attempts} attempts reached the declared limit of {max_attempts}"
             )
             parked = ""
             if self.manifest.state_policy.on_exhaustion == "park_and_restore":
-                parked = self._park(target, attempts)
+                parked = self._park(target, attempts, item=self._item_scope(target))
             self.journal.append(JournalEntry(
                 run_id=self.run_id, phase=target, kind="escalate", ok=False,
                 verdict="max_attempts", candidate_rev=parked,
@@ -1468,17 +1528,21 @@ class Kernel:
         preceding = self.manifest.phase_by_name(str(route.get("phase") or ""))
         return preceding is not None and preceding.kind in {"gate", "script"}
 
-    def _park(self, phase_name: str, attempt: int) -> str:
+    def _park(self, phase_name: str, attempt: int, item: str | None = None) -> str:
         """Give up on a phase without either keeping or losing the rejected work.
 
         The attempt is preserved on a `rejected/...` branch so its diff can be
         read afterwards, and the working tree is reset to the last accepted
         commit — so the repository is never left holding changes that failed
-        their checks.
+        their checks. `attempt` counts are now scoped to a loop item, so the
+        item name must be part of the ref: two items can each exhaust their
+        own budget at the same local attempt number, and without it the second
+        item's `git branch -f` would silently retarget the first item's ref.
         """
         if self.checkpoint is None:
             return ""
-        ref = f"rejected/{self.task_id}/{phase_name}-{attempt}"
+        item_suffix = f"-{self._safe_name(Path(item).name)}" if item else ""
+        ref = f"rejected/{self.task_id}/{phase_name}{item_suffix}-{attempt}"
         parked = ""
         if self.checkpoint.is_dirty() or (
             self.accepted_revision and self.checkpoint.current_rev() != self.accepted_revision
