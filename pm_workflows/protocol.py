@@ -80,6 +80,7 @@ class JournalEntry:
     errors: list[str] = field(default_factory=list)
     result: dict[str, Any] | None = None
     trace_path: str | None = None
+    session_ref: str | None = None
     timestamp: str = field(default_factory=utc_now)
 
     def to_dict(self) -> dict[str, Any]:

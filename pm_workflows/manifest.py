@@ -503,10 +503,11 @@ def _validate(workflow: Workflow, extensions: PhaseExtensionRegistry) -> None:
 
         if phase.kind == "human":
             if workflow.human_resolver.mode != "stdin":
-                raise ManifestError(
-                    f"{path}: phase '{phase.name}' is kind 'human' but "
-                    f"human_resolver.mode is '{workflow.human_resolver.mode}'"
-                )
+                if workflow.human_resolver.mode != "external":
+                    raise ManifestError(
+                        f"{path}: phase '{phase.name}' is kind 'human' but "
+                        f"human_resolver.mode is '{workflow.human_resolver.mode}'"
+                    )
             if not phase.next:
                 raise ManifestError(f"{path}: human phase '{phase.name}' declares no next")
             if not phase.question and not phase.question_from_result:

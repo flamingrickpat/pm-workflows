@@ -90,6 +90,7 @@ class Kernel:
         ] | None = None,
         resource_resolver: Callable[[str, str, Path, Path], Path] | None = None,
         external_answer_root: Path | None = None,
+        human_resolution: str | None = None,
     ) -> None:
         self.manifest_path = Path(manifest_path)
         self.workspace = Path(workspace).resolve()
@@ -116,6 +117,10 @@ class Kernel:
         self.external_answer_root = Path(
             external_answer_root or self.kernel_data / "answers"
         ).resolve()
+        # Loop execution overrides the manifest resolver for human phases so
+        # the controller can route questions through conversations while
+        # standalone execution keeps its declared behavior.
+        self.human_resolution = human_resolution
 
         self._variables = {
             "TASK_ID": task_id,
@@ -884,6 +889,7 @@ class Kernel:
             item=self.current_item, errors=errors,
             result=agent.result_json, trace_path=agent.trace_path,
             artifacts=archived_artifacts,
+            session_ref=agent.session_ref or None,
         ))
 
         print(f"    -> status={status or 'CONTRACT VIOLATION'}")
@@ -1099,6 +1105,9 @@ class Kernel:
         question = phase.question
         if phase.question_from_result:
             question = self._last_result_field(phase.question_from_result) or question
+        mode = self.human_resolution or self.manifest.human_resolver.mode
+        if mode == "external":
+            return self._execute_external_human(phase, question)
         print(f"\n{'-' * 68}")
         print(f"USER INPUT REQUIRED  ({phase.name})")
         print(f"{'-' * 68}")
@@ -1111,6 +1120,44 @@ class Kernel:
             verdict="answered", answer=answer, item=self.current_item,
         ))
         return {"valid": True, "status": None, "errors": [], "data": {"answer": answer}}
+
+    def _execute_external_human(
+        self, phase: PhaseConfig, question: str
+    ) -> dict[str, Any]:
+        """Resolve one human phase through a durable external answer receipt.
+
+        Loop execution owns the conversation: the kernel suspends until the
+        controller writes one ``pm.answer-receipt.v1`` file whose
+        ``resume_phase`` names this phase, then resumes and consumes it.
+        """
+        answer = self._consume_external_answer(phase)
+        if answer is not None:
+            self.pending_answer = answer
+            self.journal.append(JournalEntry(
+                run_id=self.run_id, phase=phase.name, kind="human", ok=True,
+                verdict="answered", answer=answer, item=self.current_item,
+            ))
+            return {
+                "valid": True, "status": None, "errors": [],
+                "data": {"answer": answer},
+            }
+        self._suspension = {
+            "action": "suspend",
+            "waiting": "user",
+            "resume_at": phase.name,
+            "summary": question.strip(),
+        }
+        self.journal.append(JournalEntry(
+            run_id=self.run_id, phase=phase.name, kind="human", ok=True,
+            verdict="waiting_user", answer=question.strip(),
+            item=self.current_item,
+        ))
+        return {
+            "valid": True,
+            "status": None,
+            "errors": [],
+            "data": {"summary": question.strip()},
+        }
 
     @staticmethod
     def _read_multiline() -> str:
@@ -1374,6 +1421,7 @@ class Kernel:
             workflow_resolver=self.workflow_resolver,
             resource_resolver=self.resource_resolver,
             external_answer_root=self.external_answer_root,
+            human_resolution=self.human_resolution,
         )
         summary = child.run()
         raw_status: Any = summary.get("terminal_status")
@@ -1607,6 +1655,8 @@ class Kernel:
             return phase.body[0].name
 
         if phase.kind == "human":
+            if self._suspension is not None:
+                return str(self._suspension.get("resume_at") or phase.name)
             return phase.next
 
         if phase.kind in {"role", "workflow"}:
