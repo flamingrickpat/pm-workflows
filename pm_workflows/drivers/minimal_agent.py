@@ -13,6 +13,15 @@ from ..protocol import AgentResult
 from .common import deployed_mcp_config, extract_json, trace_write
 
 
+class ProviderExhaustedError(RuntimeError):
+    """The local model endpoint stayed unusable after the provider retries.
+
+    Live loop deployments treat this as a fatal infrastructure fault rather
+    than an invalid agent response. Standalone callers keep the historical
+    normalization by leaving ``fatal_provider_exhaustion`` disabled.
+    """
+
+
 class PmCoderDriver:
     """Run one fresh role session through the installed ``pm-coder`` package."""
 
@@ -27,6 +36,8 @@ class PmCoderDriver:
         api_key_env: str = "OPENAI_API_KEY",
         max_turns: int = 80,
         timeout_seconds: int = 7200,
+        fatal_provider_exhaustion: bool = False,
+        log_root: Path | None = None,
     ) -> None:
         self.model = model
         self.effort = effort
@@ -34,6 +45,8 @@ class PmCoderDriver:
         self.api_key_env = api_key_env
         self.max_turns = max_turns
         self.timeout_seconds = timeout_seconds
+        self.fatal_provider_exhaustion = fatal_provider_exhaustion
+        self.log_root = Path(log_root) if log_root is not None else None
 
     def run_session(
         self,
@@ -64,7 +77,12 @@ class PmCoderDriver:
                 prompt,
                 cwd=work_dir,
                 run_id=f"{run_id}_{attempt}",
-                log_root=(trace_file.parent.parent / "pm-coder") if trace_file else Path.home() / ".pm" / "pm-workflows" / "pm-coder",
+                log_root=(
+                    self.log_root
+                    or (trace_file.parent.parent / "pm-coder")
+                    if trace_file
+                    else Path.home() / ".pm" / "pm-coder"
+                ),
                 base_url=self.base_url,
                 api_key=os.environ.get(self.api_key_env) or "local",
                 model=self.model or None,
@@ -76,11 +94,18 @@ class PmCoderDriver:
             stdout = str(payload.get("response", ""))
             result_json = extract_json(stdout)
             usage = payload.get("tokens_used", {})
+            session_ref = str(payload.get("run_id", "") or "")
             error = None
             exit_code = 0
         except Exception as exc:  # Agent failures are normalized for the kernel.
+            if self.fatal_provider_exhaustion and _is_provider_exhaustion(exc):
+                raise ProviderExhaustedError(
+                    f"pm-coder exhausted provider retries: "
+                    f"{type(exc).__name__}: {exc}"
+                ) from exc
             stdout = ""
             result_json = None
+            session_ref = ""
             usage = {}
             exception_type = type(exc).__name__
             exception_message = str(exc)
@@ -116,7 +141,29 @@ class PmCoderDriver:
             usage=usage if isinstance(usage, dict) else {},
             error=error,
             trace_path=str(trace_file) if trace_file else None,
+            session_ref=session_ref,
         )
+
+
+_PROVIDER_EXHAUSTION_MARKERS = (
+    "endpoint did not recover",
+    "endpoint unavailable",
+    "wall-clock limit",
+)
+
+
+def _is_provider_exhaustion(exc: BaseException) -> bool:
+    """True when the failure is the model endpoint, not the model output."""
+    try:
+        from pm_coder import EndpointRequestError
+    except ImportError:  # pragma: no cover - pm_coder is always present here.
+        EndpointRequestError = ()  # type: ignore[assignment]
+    if isinstance(exc, (ConnectionError, OSError, TimeoutError)):
+        return True
+    if isinstance(exc, EndpointRequestError):
+        return True
+    message = str(exc).casefold()
+    return any(marker in message for marker in _PROVIDER_EXHAUSTION_MARKERS)
 
 
 # Compatibility name for workflow manifests that still say ``minimal_agent``.
