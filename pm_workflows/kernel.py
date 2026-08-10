@@ -19,12 +19,16 @@ import json
 import os
 import re
 import shutil
+import time
 import urllib.error
 import urllib.request
+import uuid
 from copy import copy
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
+
+import yaml
 
 from .checkpoint import GitCheckpoint
 from .child import (
@@ -36,6 +40,7 @@ from .child import (
 )
 from .drivers import build_driver
 from .drivers.python_driver import PythonDriver
+from .extensions import EMPTY_PHASE_EXTENSIONS, PhaseExtensionRegistry
 from .gates import run_gate
 from .journal import Journal
 from .manifest import ManifestError, Workflow, parse_workflow
@@ -47,6 +52,8 @@ from .protocol import (
     JournalEntry,
     PhaseConfig,
     RoleConfig,
+    StepResult,
+    WorkflowResolution,
 )
 from .python_role import RoleContext
 from .ratelimit import TokenLimitError
@@ -77,6 +84,12 @@ class Kernel:
         allowed_effects: set[str] | None = None,
         require_http_mcp: bool = False,
         mcp_http_timeout: float = 5.0,
+        phase_extensions: PhaseExtensionRegistry | None = None,
+        workflow_resolver: Callable[
+            [str, Path, Path], Path | WorkflowResolution
+        ] | None = None,
+        resource_resolver: Callable[[str, str, Path, Path], Path] | None = None,
+        external_answer_root: Path | None = None,
     ) -> None:
         self.manifest_path = Path(manifest_path)
         self.workspace = Path(workspace).resolve()
@@ -100,15 +113,25 @@ class Kernel:
         )
         self.kernel_data = root / self.run_id
         self.kernel_data.mkdir(parents=True, exist_ok=True)
+        self.external_answer_root = Path(
+            external_answer_root or self.kernel_data / "answers"
+        ).resolve()
 
-        variables = {
+        self._variables = {
             "TASK_ID": task_id,
             "WORKSPACE": str(self.workspace),
             "TARGET": str(self.workspace),
             "TASK_DIR": str(self.task_dir),
             "BASE": str(self.base_dir),
         }
-        self.manifest: Workflow = parse_workflow(self.manifest_path, variables)
+        self.phase_extensions = phase_extensions or EMPTY_PHASE_EXTENSIONS
+        self.workflow_resolver = workflow_resolver
+        self.resource_resolver = resource_resolver
+        self.manifest: Workflow = parse_workflow(
+            self.manifest_path,
+            self._variables,
+            extensions=self.phase_extensions,
+        )
         self.depth_remaining = (
             self.manifest.budgets.max_depth
             if depth_remaining is None
@@ -138,6 +161,7 @@ class Kernel:
             self.manifest.driver.base_url = base_url
         if api_key_env is not None:
             self.manifest.driver.api_key_env = api_key_env
+        self._effective_driver = copy(self.manifest.driver)
         add_dirs = self.manifest.driver.add_dirs or [str(self.base_dir)]
 
         # A caller may supply its own driver; otherwise it comes from the
@@ -198,6 +222,11 @@ class Kernel:
         self.pending_answer: str | None = None
         self.current_item: str | None = None
         self.exit_reason = ""
+        self._step_started = False
+        self._next_phase_name: str | None = None
+        self._finished = False
+        self._announced = False
+        self._suspension: dict[str, Any] | None = None
         self._render_state_md("init")
 
     # ------------------------------------------------------------------ setup
@@ -243,6 +272,13 @@ class Kernel:
             if self.manifest.state_policy.on_resume == "retain":
                 print("  retaining current workspace state by configured state_policy")
                 return prior
+            boundary = self.journal.last_lease_boundary()
+            if (
+                boundary is not None
+                and (boundary.get("result") or {}).get("accepted_revision") == prior
+            ):
+                print("  preserving the workspace from a completed lease boundary")
+                return prior
             if head != prior:
                 resume_phase = self._resume_point(announce=False)
                 if self._candidate_is_pending_followup(
@@ -269,78 +305,240 @@ class Kernel:
 
     # -------------------------------------------------------------------- run
 
-    def run(self) -> dict[str, Any]:
+    def _announce_start(self) -> None:
+        if self._announced:
+            return
+        self._announced = True
         print(f"\n{'=' * 68}")
         print(f"KERNEL  task={self.task_id}")
         print(f"  workflow : {self.manifest.name}  ({self.manifest_path.name})")
         print(f"  target   : {self.workspace}")
         print(f"  base     : {self.base_dir}")
-        print(f"  agent    : {self.manifest.driver.kind} "
-              f"model={self.manifest.driver.model or '(default)'} "
-              f"effort={self.manifest.driver.effort or '(default)'}")
+        print(
+            f"  agent    : {self.manifest.driver.kind} "
+            f"model={self.manifest.driver.model or '(default)'} "
+            f"effort={self.manifest.driver.effort or '(default)'}"
+        )
         print(f"  journal  : {self.journal.path}")
         print(f"{'=' * 68}\n")
 
-        phase = self._resume_point()
-        while phase is not None:
-            if self._over_phase_budget(phase):
-                break
-            try:
-                result = self._execute_phase(phase)
-            except TokenLimitError as limit:
-                self.exit_reason = (
-                    f"{phase.name}: {limit.agent_kind} usage limit; rerun this "
-                    "task with another --coding-agent to continue"
-                )
-                print(f"\n!!! {self.exit_reason}")
-                break
-            # A revision is accepted only by a phase that declares it, and the
-            # phase that declares it should be the last check validating the
-            # work — never the role that produced it. Accepting a role's output
-            # before its checks run would make the revert target the very
-            # attempt the checks are about to reject.
-            if result["valid"] and phase.checkpoint_after:
-                self._accept(
-                    phase.name,
-                    self.journal.attempts_for_phase(phase.name, item=self._item_scope(phase.name)),
-                )
-            self._render_state_md(phase.name)
-            target = self._route(phase, result)
-            self.journal.append(JournalEntry(
-                run_id=self.run_id, phase=phase.name, kind="route",
-                ok=True, verdict=target or ROUTE_STOP, item=self.current_item,
-            ))
-            phase = self._resolve_target(phase, target)
-            # Routing is where reverts, item completions and give-ups happen.
-            # Re-render so the role dispatched next reads a state file that
-            # already shows them — otherwise the session retried after a revert
-            # sees a history in which its discarded attempt still succeeded.
-            self._render_state_md(phase.name if phase else "finished")
+    def _reload_manifest(self) -> None:
+        """Load the current manifest before each phase boundary."""
+        refreshed = parse_workflow(
+            self.manifest_path,
+            self._variables,
+            extensions=self.phase_extensions,
+        )
+        refreshed.driver = copy(self._effective_driver)
+        self.manifest = refreshed
 
-        self._render_state_md("finished")
-        summary = {
+    def _summary(self) -> dict[str, Any]:
+        suspended = (
+            f"suspended:{self._suspension.get('waiting')}"
+            if self._suspension is not None else ""
+        )
+        summary: dict[str, Any] = {
             "task_id": self.task_id,
             "workflow": self.manifest.name,
             "target": str(self.workspace),
             "accepted_revision": self.accepted_revision,
             "journal": str(self.journal.path),
             "journal_entries": len(self.journal.read_all()),
-            "exit_reason": self.exit_reason or "completed",
+            "exit_reason": self.exit_reason or suspended or "completed",
             "ok": self.exit_reason == "",
         }
         terminal = self._terminal_execution()
         summary["terminal_phase"] = terminal.get("phase") if terminal else None
         summary["terminal_status"] = terminal.get("status") if terminal else None
         summary["terminal_result"] = terminal.get("result") if terminal else None
+        return summary
+
+    def run(self) -> dict[str, Any]:
+        """Run phase boundaries until the workflow reaches a terminal route."""
+        self._announce_start()
+        while True:
+            boundary = self.step()
+            if boundary.disposition != "continue":
+                break
+        summary = self._summary()
         print(f"\n{'=' * 68}")
-        print(f"KERNEL finished: {summary['exit_reason']} "
-              f"({summary['journal_entries']} journal entries)")
+        print(
+            f"KERNEL finished: {summary['exit_reason']} "
+            f"({summary['journal_entries']} journal entries)"
+        )
         print(f"{'=' * 68}\n")
         return summary
 
+    @property
+    def pending_phase_name(self) -> str | None:
+        """Return the phase that the next ``step()`` call will execute."""
+        if self._finished:
+            return None
+        if self._step_started:
+            return self._next_phase_name
+        self._reload_manifest()
+        phase = self._resume_point(announce=False)
+        return phase.name if phase else None
+
+    def phase_attempts(self, phase_name: str) -> int:
+        """Return the active attempt count for a phase and current loop item."""
+        return self.journal.attempts_for_phase(
+            phase_name, item=self._item_scope(phase_name)
+        )
+
+    def step(self) -> StepResult:
+        """Execute at most one manifest phase and return its stable boundary."""
+        self._announce_start()
+        started_at = time.monotonic()
+        if self._suspension is not None:
+            raise RuntimeError(
+                "this kernel instance is suspended; resume with a fresh Kernel "
+                "after the external receipt is durable"
+            )
+        if self._finished:
+            return self._step_result(
+                phase=None, result=None, attempt=0, started_at=started_at
+            )
+
+        self._reload_manifest()
+        if not self._step_started:
+            phase = self._resume_point()
+            self._step_started = True
+        else:
+            phase = self.manifest.phase_by_name(self._next_phase_name or "")
+            if self._next_phase_name and phase is None:
+                raise ManifestError(
+                    f"{self.manifest.path}: next phase '{self._next_phase_name}' "
+                    "was removed at an active phase boundary"
+                )
+
+        if phase is None:
+            self._finished = True
+            self._render_state_md("finished")
+            return self._step_result(
+                phase=None, result=None, attempt=0, started_at=started_at
+            )
+
+        if self._over_phase_budget(phase):
+            self._next_phase_name = None
+            self._finished = True
+            self._render_state_md("finished")
+            return self._step_result(
+                phase=phase,
+                result={"valid": False, "status": None, "data": {}, "errors": []},
+                attempt=self.journal.attempts_for_phase(
+                    phase.name, item=self._item_scope(phase.name)
+                ),
+                started_at=started_at,
+            )
+
+        try:
+            result = self._execute_phase(phase)
+        except TokenLimitError as limit:
+            self.exit_reason = (
+                f"{phase.name}: {limit.agent_kind} usage limit; rerun this "
+                "task with another --coding-agent to continue"
+            )
+            print(f"\n!!! {self.exit_reason}")
+            self._next_phase_name = None
+            self._finished = True
+            self._render_state_md("finished")
+            return self._step_result(
+                phase=phase,
+                result={
+                    "valid": False,
+                    "status": None,
+                    "data": {},
+                    "errors": [str(limit)],
+                },
+                attempt=self.journal.attempts_for_phase(
+                    phase.name, item=self._item_scope(phase.name)
+                ),
+                started_at=started_at,
+            )
+
+        if result["valid"] and phase.checkpoint_after:
+            self._accept(
+                phase.name,
+                self.journal.attempts_for_phase(
+                    phase.name, item=self._item_scope(phase.name)
+                ),
+            )
+        self._render_state_md(phase.name)
+        target = self._route(phase, result)
+        self.journal.append(JournalEntry(
+            run_id=self.run_id,
+            phase=phase.name,
+            kind="route",
+            ok=True,
+            verdict=target or ROUTE_STOP,
+            item=self.current_item,
+            result=self._suspension,
+        ))
+        next_phase = self._resolve_target(phase, target)
+        self._next_phase_name = next_phase.name if next_phase else None
+        self._finished = next_phase is None
+        self._render_state_md(next_phase.name if next_phase else "finished")
+        return self._step_result(
+            phase=phase,
+            result=result,
+            attempt=self.journal.attempts_for_phase(
+                phase.name, item=self._item_scope(phase.name)
+            ),
+            started_at=started_at,
+        )
+
+    def _step_result(
+        self,
+        *,
+        phase: PhaseConfig | None,
+        result: dict[str, Any] | None,
+        attempt: int,
+        started_at: float,
+    ) -> StepResult:
+        values = result or {}
+        waiting_kind = (
+            str(self._suspension.get("waiting")) if self._suspension else None
+        )
+        disposition = (
+            "suspend"
+            if self._suspension is not None
+            else "terminal" if self._finished else "continue"
+        )
+        errors = tuple(str(error) for error in values.get("errors", []))
+        summary = str((values.get("data") or {}).get("summary", ""))
+        if not summary and errors:
+            summary = errors[0]
+        return StepResult(
+            task_id=self.task_id,
+            run_id=self.run_id,
+            workflow=self.manifest.name,
+            phase=phase.name if phase else None,
+            kind=phase.kind if phase else None,
+            attempt=attempt,
+            status=values.get("status"),
+            valid=bool(values.get("valid", self.exit_reason == "")),
+            next_phase=self._next_phase_name,
+            disposition=disposition,
+            exit_reason=(
+                f"suspended:{waiting_kind}"
+                if waiting_kind
+                else (self.exit_reason or "completed") if self._finished else ""
+            ),
+            accepted_revision=self.accepted_revision,
+            journal=str(self.journal.path),
+            duration_seconds=time.monotonic() - started_at,
+            data=dict(values.get("data") or {}),
+            errors=errors,
+            workflow_ok=bool(values.get("valid", self.exit_reason == "")),
+            waiting_kind=waiting_kind,
+            terminal_status=values.get("status") if self._finished else None,
+            summary=summary,
+        )
+
     def _terminal_execution(self) -> dict[str, Any] | None:
         for entry in reversed(self.journal.read_all()):
-            if entry.get("kind") in {"role", "workflow"}:
+            if entry.get("kind") in {"role", "workflow"} or entry.get("status") is not None:
                 return entry
         return None
 
@@ -460,19 +658,120 @@ class Kernel:
     # ------------------------------------------------------------- execution
 
     def _execute_phase(self, phase: PhaseConfig) -> dict[str, Any]:
-        if phase.kind == "role":
-            return self._execute_role(phase)
-        if phase.kind == "gate":
-            return self._execute_check(phase, phase.predicate or "", "gate")
-        if phase.kind == "script":
-            return self._execute_check(phase, phase.script or "", "script")
-        if phase.kind == "human":
-            return self._execute_human(phase)
-        if phase.kind == "loop":
-            return self._execute_loop(phase)
-        if phase.kind == "workflow":
-            return self._execute_workflow(phase)
-        raise ManifestError(f"unsupported phase kind '{phase.kind}' in '{phase.name}'")
+        extension = self.phase_extensions.get(phase.kind)
+        if extension is not None:
+            return self._execute_extension(phase, extension.execute)
+        executors: dict[str, Callable[[PhaseConfig], dict[str, Any]]] = {
+            "role": self._execute_role,
+            "gate": lambda value: self._execute_check(
+                value, value.predicate or "", "gate"
+            ),
+            "script": lambda value: self._execute_check(
+                value, value.script or "", "script"
+            ),
+            "human": self._execute_human,
+            "loop": self._execute_loop,
+            "workflow": self._execute_workflow,
+        }
+        try:
+            executor = executors[phase.kind]
+        except KeyError as exc:
+            raise ManifestError(
+                f"unsupported phase kind '{phase.kind}' in '{phase.name}'"
+            ) from exc
+        return executor(phase)
+
+    def _execute_extension(
+        self,
+        phase: PhaseConfig,
+        executor: Callable[[Any, PhaseConfig], Any],
+    ) -> dict[str, Any]:
+        """Run one extension and record the same durable attempt boundary."""
+        attempt = self.journal.attempts_for_phase(
+            phase.name, item=self._item_scope(phase.name)
+        ) + 1
+        raw = executor(self, phase)
+        if not isinstance(raw, dict):
+            try:
+                raw = dict(raw)
+            except (TypeError, ValueError) as exc:
+                raise ManifestError(
+                    f"phase extension '{phase.kind}' for '{phase.name}' returned "
+                    f"{type(raw).__name__}, not a mapping"
+                ) from exc
+        if not isinstance(raw.get("valid"), bool):
+            raise ManifestError(
+                f"phase extension '{phase.kind}' for '{phase.name}' must return "
+                "a boolean 'valid' field"
+            )
+        data = raw.get("data", {})
+        errors = raw.get("errors", [])
+        if not isinstance(data, dict):
+            raise ManifestError(
+                f"phase extension '{phase.kind}' for '{phase.name}' must return "
+                "a mapping 'data' field"
+            )
+        if not isinstance(errors, list):
+            raise ManifestError(
+                f"phase extension '{phase.kind}' for '{phase.name}' must return "
+                "a list 'errors' field"
+            )
+        result = {
+            "valid": raw["valid"],
+            "status": raw.get("status"),
+            "data": data,
+            "errors": [str(error) for error in errors],
+        }
+        self.journal.append(JournalEntry(
+            run_id=self.run_id,
+            phase=phase.name,
+            kind=phase.kind,
+            role=phase.role,
+            attempt=attempt,
+            ok=result["valid"],
+            verdict="valid" if result["valid"] else "invalid",
+            status=result["status"],
+            item=self.current_item,
+            errors=result["errors"],
+            result=result["data"],
+        ))
+        return result
+
+    def _consume_external_answer(self, phase: PhaseConfig) -> str | None:
+        """Read one durable loop-engine answer receipt exactly once."""
+        if not self.external_answer_root.is_dir():
+            return None
+        consumed = {
+            entry.get("verdict")
+            for entry in self.journal.read_all()
+            if entry.get("kind") == "external_answer"
+        }
+        for path in sorted(self.external_answer_root.glob("*.yaml")):
+            try:
+                value = yaml.safe_load(path.read_text(encoding="utf-8"))
+            except yaml.YAMLError as exc:
+                raise ManifestError(f"{path}: invalid answer receipt: {exc}") from exc
+            if not isinstance(value, dict) or value.get("schema") != "pm.answer-receipt.v1":
+                raise ManifestError(f"{path}: invalid answer receipt schema")
+            identifier = str(value.get("id", path.stem))
+            if identifier in consumed:
+                continue
+            resume_phase = str(value.get("resume_phase", ""))
+            if resume_phase and resume_phase != phase.name:
+                continue
+            answer = value.get("answer")
+            if not isinstance(answer, str) or not answer.strip():
+                raise ManifestError(f"{path}: answer receipt has no answer text")
+            self.journal.append(JournalEntry(
+                run_id=self.run_id,
+                phase=phase.name,
+                kind="external_answer",
+                ok=True,
+                verdict=identifier,
+                answer=answer,
+            ))
+            return answer
+        return None
 
     def _execute_role(self, phase: PhaseConfig) -> dict[str, Any]:
         role = self.manifest.roles[phase.role or ""]
@@ -489,7 +788,7 @@ class Kernel:
                     attempt=attempt, ok=False, verdict="capability_denied", errors=errors,
                 ))
                 return {"valid": False, "status": None, "errors": errors, "data": {}}
-        skill_path = self._resolve_path(role.skill)
+        skill_path = self._resolve_resource("skill", role.skill)
         if not skill_path.is_file():
             raise ManifestError(
                 f"role '{role.name}' points at a missing skill: {skill_path}"
@@ -497,7 +796,7 @@ class Kernel:
 
         feedback = self.pending_feedback or self._feedback(phase.name)
         self.pending_feedback = None
-        answer = self.pending_answer
+        answer = self.pending_answer or self._consume_external_answer(phase)
         self.pending_answer = None
 
         self._settle_worktree(phase)
@@ -1038,7 +1337,8 @@ class Kernel:
             indent=2,
             default=str,
         )
-        manifest = self._resolve_child_manifest(phase.workflow or "")
+        child_resolution = self._resolve_child_workflow(phase.workflow or "")
+        manifest = child_resolution.manifest_path
         allowed_mcp, allowed_effects = self._child_capabilities(phase)
         child_driver = self.driver
         if (
@@ -1053,7 +1353,7 @@ class Kernel:
             workspace=self.workspace,
             task_id=child_task_id,
             task_text=task_text,
-            base_dir=self.base_dir,
+            base_dir=child_resolution.deployment_base,
             coding_agent=getattr(child_driver, "kind", None),
             kernel_data_root=child_root,
             run_id="run",
@@ -1070,6 +1370,10 @@ class Kernel:
                 phase.capabilities.http_timeout_seconds
                 if phase.capabilities else 5.0
             ),
+            phase_extensions=self.phase_extensions,
+            workflow_resolver=self.workflow_resolver,
+            resource_resolver=self.resource_resolver,
+            external_answer_root=self.external_answer_root,
         )
         summary = child.run()
         raw_status: Any = summary.get("terminal_status")
@@ -1167,7 +1471,32 @@ class Kernel:
                 return status
         return "completed" if "completed" in contract.statuses else statuses[0]
 
-    def _resolve_child_manifest(self, name: str) -> Path:
+    def _resolve_child_workflow(self, name: str) -> WorkflowResolution:
+        if self.workflow_resolver is not None:
+            value = self.workflow_resolver(name, self.manifest_path, self.base_dir)
+            if isinstance(value, WorkflowResolution):
+                resolution = WorkflowResolution(
+                    manifest_path=Path(value.manifest_path).resolve(),
+                    deployment_base=Path(value.deployment_base).resolve(),
+                    qualified_name=value.qualified_name,
+                )
+            else:
+                resolution = WorkflowResolution(
+                    manifest_path=Path(value).resolve(),
+                    deployment_base=self.base_dir,
+                    qualified_name=name,
+                )
+            if not resolution.manifest_path.is_file():
+                raise ManifestError(
+                    "workflow resolver returned a missing path for "
+                    f"'{name}': {resolution.manifest_path}"
+                )
+            if not resolution.deployment_base.is_dir():
+                raise ManifestError(
+                    "workflow resolver returned a missing deployment base for "
+                    f"'{name}': {resolution.deployment_base}"
+                )
+            return resolution
         candidate = Path(name)
         choices = [candidate] if candidate.is_absolute() else [
             self.base_dir / "workflows" / name / f"{name}.workflow.md",
@@ -1177,11 +1506,19 @@ class Kernel:
         ]
         for choice in choices:
             if choice.is_file():
-                return choice.resolve()
+                return WorkflowResolution(
+                    manifest_path=choice.resolve(),
+                    deployment_base=self.base_dir,
+                    qualified_name=name,
+                )
         raise ManifestError(
             f"child workflow '{name}' was not found; checked: "
             + ", ".join(str(choice) for choice in choices)
         )
+
+    def _resolve_child_manifest(self, name: str) -> Path:
+        """Compatibility view for callers that only need the child path."""
+        return self._resolve_child_workflow(name).manifest_path
 
     def _child_capabilities(
         self, phase: PhaseConfig
@@ -1232,7 +1569,36 @@ class Kernel:
 
     # --------------------------------------------------------------- routing
 
+    def _status_target(
+        self,
+        phase: PhaseConfig,
+        status: str,
+    ) -> str | None:
+        route = phase.on_status[status]
+        if isinstance(route, str):
+            return route
+        if isinstance(route, dict) and route.get("action") == "suspend":
+            self._suspension = dict(route)
+            return str(route["resume_at"])
+        raise ManifestError(
+            f"phase '{phase.name}' status '{status}' has an invalid route"
+        )
+
     def _route(self, phase: PhaseConfig, result: dict[str, Any]) -> str | None:
+        if (
+            self.phase_extensions.get(phase.kind) is not None
+            and phase.kind not in {"role", "gate", "script", "loop", "human", "workflow"}
+        ):
+            if result["valid"]:
+                status = result.get("status")
+                if status is not None and status in phase.on_status:
+                    return self._status_target(phase, status)
+                if phase.next:
+                    return phase.next
+                return self._on_failure(phase, phase.on_failure, result)
+            return self._on_failure(
+                phase, phase.on_fail or phase.on_failure or phase.on_invalid, result
+            )
         if phase.kind == "loop":
             if result["data"].get("exhausted"):
                 return phase.exit
@@ -1247,7 +1613,7 @@ class Kernel:
             if result["valid"]:
                 status = result["status"]
                 if status is not None and status in phase.on_status:
-                    return phase.on_status[status]
+                    return self._status_target(phase, status)
                 if phase.next:
                     return phase.next
                 return self._on_failure(phase, phase.on_invalid, result)
@@ -1607,6 +1973,15 @@ class Kernel:
             "it. Never edit, stage, or commit a change to it.",
             "",
         ]
+        if self.journal.pending_recovery_notice():
+            lines += [
+                "--- BEGIN SUPERVISOR RECOVERY NOTICE ---",
+                "The previous supervisor execution ended unexpectedly. Git-managed",
+                "state was restored where configured. External state can differ.",
+                "Inspect current state and adapt before you continue.",
+                "--- END SUPERVISOR RECOVERY NOTICE ---",
+                "",
+            ]
         if role.instruction:
             lines += [role.instruction.strip(), ""]
         if self.current_item:
@@ -1747,10 +2122,33 @@ class Kernel:
             )
         text = "\n".join(lines) + "\n"
         self.task_dir.mkdir(parents=True, exist_ok=True)
-        (self.task_dir / "state.md").write_text(text, encoding="utf-8")
+        state_path = self.task_dir / "state.md"
+        temporary = state_path.with_name(f".{state_path.name}.{uuid.uuid4().hex}.tmp")
+        temporary.write_text(text, encoding="utf-8")
+        os.replace(temporary, state_path)
         # Reference copy outside the repo, so a gate can prove the file was not
         # edited by an agent.
-        (self.kernel_data / "state.md").write_text(text, encoding="utf-8")
+        reference_path = self.kernel_data / "state.md"
+        temporary_reference = reference_path.with_name(
+            f".{reference_path.name}.{uuid.uuid4().hex}.tmp"
+        )
+        temporary_reference.write_text(text, encoding="utf-8")
+        os.replace(temporary_reference, reference_path)
+
+    def _resolve_resource(self, kind: str, relative: str) -> Path:
+        if self.resource_resolver is not None:
+            resolved = Path(
+                self.resource_resolver(
+                    kind, relative, self.manifest_path, self.base_dir
+                )
+            ).resolve()
+            if not resolved.is_file():
+                raise ManifestError(
+                    f"resource resolver returned a missing {kind} path for "
+                    f"'{relative}': {resolved}"
+                )
+            return resolved
+        return self._resolve_path(relative)
 
     def _resolve_path(self, relative: str) -> Path:
         path = Path(relative)

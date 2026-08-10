@@ -99,3 +99,49 @@ def test_journal_creates_parent_dirs(tmp_path):
     j = Journal(tmp_path / "deep" / "nested" / "journal.jsonl")
     assert j.path.parent.exists()
     assert j.path.exists()
+
+
+def test_recovery_append_isolates_a_torn_final_line(tmp_path):
+    path = tmp_path / "journal.jsonl"
+    path.write_text(
+        '{"kind":"role","phase":"one"}\n{"kind":"route"',
+        encoding="utf-8",
+    )
+    journal = Journal(path)
+
+    journal.append_recovery(
+        restored_revision="abc123",
+        resume_phase="two",
+        active_through_entry=1,
+        abandoned_entry_range="2-2",
+    )
+
+    entries = journal.read_all()
+    assert entries[0] == {"kind": "role", "phase": "one"}
+    assert len(entries) == 2
+    assert entries[1]["run_id"] == "fatal-recovery"
+    assert entries[1]["phase"] == "two"
+    assert entries[1]["kind"] == "fatal_recovery"
+    assert entries[1]["ok"] is True
+    assert entries[1]["verdict"] == "restored"
+
+
+def test_journal_rejects_malformed_json_between_normal_records(tmp_path):
+    path = tmp_path / "journal.jsonl"
+    path.write_text(
+        '{"kind":"role","phase":"one"}\n'
+        '{"kind":"broken"\n'
+        '{"kind":"route","phase":"one","verdict":"two"}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="malformed journal JSON at line 2"):
+        Journal(path).read_complete()
+
+
+def test_journal_rejects_complete_non_object_records(tmp_path):
+    path = tmp_path / "journal.jsonl"
+    path.write_text('["not", "an", "entry"]\n', encoding="utf-8")
+
+    with pytest.raises(ValueError, match="is not a JSON object"):
+        Journal(path).read_complete()

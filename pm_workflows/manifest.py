@@ -14,6 +14,7 @@ from typing import Any
 
 import yaml
 
+from .extensions import EMPTY_PHASE_EXTENSIONS, PhaseExtensionRegistry
 from .protocol import (
     ChildCapabilitiesConfig,
     ChildContextConfig,
@@ -32,6 +33,7 @@ from .protocol import (
 
 # Iterator sources the kernel knows how to enumerate.
 ITERATOR_SOURCES = frozenset({"pending_work_items"})
+BUILTIN_PHASE_KINDS = frozenset({"role", "gate", "script", "loop", "human", "workflow"})
 VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_.]*)\}")
 
 
@@ -334,7 +336,11 @@ def _parse_child_fields(raw: dict[str, Any], path: Path, name: str) -> dict[str,
     }
 
 
-def _parse_phase(raw: dict[str, Any], path: Path) -> PhaseConfig:
+def _parse_phase(
+    raw: dict[str, Any],
+    path: Path,
+    extensions: PhaseExtensionRegistry,
+) -> PhaseConfig:
     if not isinstance(raw, dict):
         raise ManifestError(f"{path}: phase entries must be mappings, got {type(raw)}")
     name = raw.get("name", "")
@@ -346,20 +352,31 @@ def _parse_phase(raw: dict[str, Any], path: Path) -> PhaseConfig:
         raise ManifestError(f"{path}: phase '{name}' on_status must be a mapping")
 
     body_raw = raw.get("body", []) or []
-    body = [_parse_phase(entry, path) for entry in body_raw]
+    body = [_parse_phase(entry, path, extensions) for entry in body_raw]
 
     args = raw.get("args", []) or []
     if isinstance(args, str):
         args = [args]
 
     child_fields = _parse_child_fields(raw, path, name)
+    kind = str(raw.get("kind", "role"))
+    extension = extensions.get(kind)
+    extension_data: dict[str, Any] = {}
+    if extension is not None and extension.parse is not None:
+        parsed = extension.parse(raw, path)
+        if not isinstance(parsed, dict):
+            parsed = dict(parsed)
+        extension_data = dict(parsed)
     return PhaseConfig(
         name=name,
-        kind=raw.get("kind", "role"),
+        kind=kind,
         route=raw.get("route", "static"),
         role=raw.get("role"),
         next=raw.get("next"),
-        on_status={str(k): str(v) for k, v in on_status.items()},
+        on_status={
+            str(key): (dict(value) if isinstance(value, dict) else str(value))
+            for key, value in on_status.items()
+        },
         on_invalid=raw.get("on_invalid"),
         on_pass=raw.get("on_pass"),
         on_fail=raw.get("on_fail"),
@@ -377,11 +394,12 @@ def _parse_phase(raw: dict[str, Any], path: Path) -> PhaseConfig:
         max_iterations=raw.get("max_iterations", 200),
         workflow=raw.get("workflow"),
         allowed_roles=raw.get("allowed_roles", []) or [],
+        extension=extension_data,
         **child_fields,
     )
 
 
-def _validate(workflow: Workflow) -> None:
+def _validate(workflow: Workflow, extensions: PhaseExtensionRegistry) -> None:
     """Fail loudly on any contract hole. This runs before the first dispatch."""
     path = workflow.path
     if not workflow.phases:
@@ -398,7 +416,8 @@ def _validate(workflow: Workflow) -> None:
             known.add(nested.name)
 
     def check_phase(phase: PhaseConfig, in_loop: bool) -> None:
-        if phase.kind not in {"role", "gate", "script", "loop", "human", "workflow"}:
+        extension = extensions.get(phase.kind)
+        if phase.kind not in BUILTIN_PHASE_KINDS and extension is None:
             raise ManifestError(f"{path}: phase '{phase.name}' has unknown kind '{phase.kind}'")
 
         for target in phase.route_targets():
@@ -412,6 +431,24 @@ def _validate(workflow: Workflow) -> None:
             if target not in known:
                 raise ManifestError(
                     f"{path}: phase '{phase.name}' routes to unknown phase '{target}'"
+                )
+
+        for status, route in phase.on_status.items():
+            if not isinstance(route, dict):
+                continue
+            if route.get("action") != "suspend":
+                raise ManifestError(
+                    f"{path}: phase '{phase.name}' status '{status}' has unknown "
+                    f"route action '{route.get('action')}'"
+                )
+            if route.get("waiting") not in {"user", "external"}:
+                raise ManifestError(
+                    f"{path}: phase '{phase.name}' suspension waiting must be "
+                    "'user' or 'external'"
+                )
+            if not isinstance(route.get("resume_at"), str) or not route["resume_at"]:
+                raise ManifestError(
+                    f"{path}: phase '{phase.name}' suspension requires resume_at"
                 )
 
         if phase.kind == "role":
@@ -591,6 +628,9 @@ def _validate(workflow: Workflow) -> None:
                     raise ManifestError(f"{path}: nested loops are not supported ('{nested.name}')")
                 check_phase(nested, in_loop=True)
 
+        if extension is not None and extension.validate is not None:
+            extension.validate(phase, workflow)
+
     for phase in workflow.phases:
         check_phase(phase, in_loop=False)
 
@@ -636,7 +676,11 @@ def _check_reachable(workflow: Workflow, known: set[str]) -> None:
         )
 
 
-def parse_workflow(path: Path, variables: dict[str, str] | None = None) -> Workflow:
+def parse_workflow(
+    path: Path,
+    variables: dict[str, str] | None = None,
+    extensions: PhaseExtensionRegistry | None = None,
+) -> Workflow:
     """Read, expand ${VAR}s, and validate a workflow manifest."""
     path = Path(path)
     text = path.read_text(encoding="utf-8")
@@ -650,6 +694,7 @@ def parse_workflow(path: Path, variables: dict[str, str] | None = None) -> Workf
         raise ManifestError(f"{path}: frontmatter is not a mapping")
 
     fm = substitute(fm, variables or {})
+    extension_registry = extensions or EMPTY_PHASE_EXTENSIONS
 
     roles: dict[str, RoleConfig] = {}
     for rname, rraw in (fm.get("roles", {}) or {}).items():
@@ -678,7 +723,10 @@ def parse_workflow(path: Path, variables: dict[str, str] | None = None) -> Workf
             instruction=rraw.get("instruction", "") or "",
         )
 
-    phases = [_parse_phase(p, path) for p in (fm.get("phases", []) or [])]
+    phases = [
+        _parse_phase(p, path, extension_registry)
+        for p in (fm.get("phases", []) or [])
+    ]
 
     cb_raw = fm.get("checkpoint_backend")
     checkpoint = None
@@ -731,5 +779,5 @@ def parse_workflow(path: Path, variables: dict[str, str] | None = None) -> Workf
         path=str(path),
     )
 
-    _validate(workflow)
+    _validate(workflow, extension_registry)
     return workflow

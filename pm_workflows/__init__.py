@@ -17,7 +17,16 @@ from .drivers import (
 from .journal import Journal
 from .kernel import Kernel
 from .manifest import ManifestError, StatePolicyConfig, Workflow, parse_workflow
-from .protocol import AgentResult, GateResult, JournalEntry, PhaseConfig, RoleConfig
+from .extensions import PhaseExtensionRegistry, PhaseKindExtension
+from .protocol import (
+    AgentResult,
+    GateResult,
+    JournalEntry,
+    PhaseConfig,
+    RoleConfig,
+    StepResult,
+    WorkflowResolution,
+)
 from .python_role import RoleContext
 
 __all__ = [
@@ -34,11 +43,15 @@ __all__ = [
     "PmCoderDriver",
     "PiDriver",
     "PhaseConfig",
+    "PhaseExtensionRegistry",
+    "PhaseKindExtension",
     "PythonDriver",
     "RoleConfig",
     "RoleContext",
     "StatePolicyConfig",
+    "StepResult",
     "Workflow",
+    "WorkflowResolution",
     "build_driver",
     "parse_workflow",
 ]

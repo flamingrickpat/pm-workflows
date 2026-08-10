@@ -4,6 +4,7 @@ from __future__ import annotations
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 # Force UTF-8 stdout for Unicode symbols on Windows consoles.
@@ -22,6 +23,15 @@ RESERVED_ROUTES = frozenset({ROUTE_NEXT_ITEM, ROUTE_EXIT_LOOP, ROUTE_STOP})
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+@dataclass(frozen=True)
+class WorkflowResolution:
+    """One catalog result with the deployment base needed by a child kernel."""
+
+    manifest_path: Path
+    deployment_base: Path
+    qualified_name: str | None = None
 
 
 @dataclass
@@ -74,6 +84,63 @@ class JournalEntry:
 
     def to_dict(self) -> dict[str, Any]:
         return {k: v for k, v in self.__dict__.items() if v is not None and v != []}
+
+
+@dataclass(frozen=True)
+class StepResult:
+    """The durable boundary produced by one kernel phase execution."""
+
+    task_id: str
+    run_id: str
+    workflow: str
+    phase: str | None
+    kind: str | None
+    attempt: int
+    status: str | None
+    valid: bool
+    next_phase: str | None
+    disposition: str
+    exit_reason: str
+    accepted_revision: str | None
+    journal: str
+    duration_seconds: float
+    data: dict[str, Any] = field(default_factory=dict)
+    errors: tuple[str, ...] = ()
+    workflow_ok: bool = True
+    waiting_kind: str | None = None
+    terminal_status: str | None = None
+    summary: str = ""
+    schema: str = "pm.step-result.v1"
+
+    @property
+    def terminal(self) -> bool:
+        return self.disposition == "terminal"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "schema": self.schema,
+            "task_id": self.task_id,
+            "run_id": self.run_id,
+            "workflow": self.workflow,
+            "phase_executed": self.phase,
+            "phase_kind": self.kind,
+            "phase_status": self.status,
+            "attempt": self.attempt,
+            "valid": self.valid,
+            "next_phase": self.next_phase,
+            "disposition": self.disposition,
+            "terminal": self.terminal,
+            "workflow_ok": self.workflow_ok,
+            "waiting_kind": self.waiting_kind,
+            "terminal_status": self.terminal_status,
+            "exit_reason": self.exit_reason,
+            "accepted_revision": self.accepted_revision,
+            "journal_path": self.journal,
+            "duration_seconds": self.duration_seconds,
+            "summary": self.summary,
+            "data": self.data,
+            "errors": list(self.errors),
+        }
 
 
 @dataclass
@@ -192,7 +259,7 @@ class PhaseConfig:
     next: str | None = None
 
     # Enum routing: declared status value -> phase name (or reserved route).
-    on_status: dict[str, str] = field(default_factory=dict)
+    on_status: dict[str, Any] = field(default_factory=dict)
     # Contract violation (no JSON, unknown status, missing field) or crash.
     on_invalid: dict[str, Any] | None = None
 
@@ -230,6 +297,10 @@ class PhaseConfig:
     child_result: ChildResultConfig | None = None
     foreach: ForeachConfig | None = None
 
+    # Data owned by an optional phase-kind extension. Built-in phases leave
+    # this empty.
+    extension: dict[str, Any] = field(default_factory=dict)
+
     def body_by_name(self, name: str) -> "PhaseConfig | None":
         for p in self.body:
             if p.name == name:
@@ -242,7 +313,13 @@ class PhaseConfig:
         for value in (self.next, self.on_pass, self.exit):
             if isinstance(value, str) and value:
                 targets.append(value)
-        targets.extend(self.on_status.values())
+        for value in self.on_status.values():
+            if isinstance(value, str) and value:
+                targets.append(value)
+            elif isinstance(value, dict) and value.get("action") == "suspend":
+                resume_at = value.get("resume_at")
+                if isinstance(resume_at, str) and resume_at:
+                    targets.append(resume_at)
         for cfg in (self.on_invalid, self.on_failure, self.on_fail):
             if isinstance(cfg, str) and cfg:
                 targets.append(cfg)
