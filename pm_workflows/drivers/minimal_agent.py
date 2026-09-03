@@ -7,7 +7,7 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from pm_coder import run_auto_sync
+from pm_coder import run_auto
 
 from ..protocol import AgentResult
 from .common import deployed_mcp_config, extract_json, trace_write
@@ -73,7 +73,7 @@ class PmCoderDriver:
             "work_dir": str(work_dir),
         })
         try:
-            payload = run_auto_sync(
+            payload = run_auto(
                 prompt,
                 cwd=work_dir,
                 run_id=f"{run_id}_{attempt}",
@@ -87,8 +87,6 @@ class PmCoderDriver:
                 api_key=os.environ.get(self.api_key_env) or "local",
                 model=self.model or None,
                 mcp_config=mcp_config,
-                request_limit=self.max_turns,
-                wall_clock_limit=self.timeout_seconds,
                 enable_thinking=self.effort in {"high", "xhigh", "max", "ultra"},
             )
             stdout = str(payload.get("response", ""))
@@ -154,13 +152,8 @@ _PROVIDER_EXHAUSTION_MARKERS = (
 
 def _is_provider_exhaustion(exc: BaseException) -> bool:
     """True when the failure is the model endpoint, not the model output."""
-    try:
-        from pm_coder import EndpointRequestError
-    except ImportError:  # pragma: no cover - pm_coder is always present here.
-        EndpointRequestError = ()  # type: ignore[assignment]
+    # pm-coder does not export a specific exhaustion error type.
     if isinstance(exc, (ConnectionError, OSError, TimeoutError)):
-        return True
-    if isinstance(exc, EndpointRequestError):
         return True
     message = str(exc).casefold()
     return any(marker in message for marker in _PROVIDER_EXHAUSTION_MARKERS)

@@ -10,7 +10,7 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
-    "pm-coder @ git+https://github.com/flamingrickpat/pm-coder.git",
+    "pm-coder @ git+https://github.com/flamingrickpat/pm-coder.git@main",
     "PyYAML>=6,<7",
 ]
 
