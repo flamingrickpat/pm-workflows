@@ -59,13 +59,17 @@ class StubDriver:
     def __init__(self, script: list[dict | str], on_call=None) -> None:
         self.script = list(script)
         self.prompts: list[str] = []
+        self.skills: list[str] = []
+        self.mcp_configs: list[Path | None] = []
         self.on_call = on_call
         self.calls = 0
 
     def run_session(self, run_id, attempt, skill, prompt, work_dir, tools=None,
-                    result_file=None, trace_file=None) -> AgentResult:
+                    result_file=None, trace_file=None, mcp_config=None) -> AgentResult:
         self.calls += 1
         self.prompts.append(prompt)
+        self.skills.append(skill)
+        self.mcp_configs.append(Path(mcp_config) if mcp_config else None)
         if self.on_call is not None:
             self.on_call(Path(work_dir), self.calls, prompt)
         payload = self.script.pop(0) if self.script else {"status": "done"}
@@ -190,6 +194,60 @@ def test_declared_status_routes_to_the_declared_phase(tmp_path: Path) -> None:
     kinds = [(e["phase"], e["kind"], e.get("verdict")) for e in _journal(tmp_path)]
     assert ("work", "role", "done") in kinds
     assert ("check", "gate", "pass") in kinds
+
+
+def test_auto_repair_uses_empty_mcp_config_and_hands_off_its_report(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    check = (
+        "import json, sys\nfrom pathlib import Path\n"
+        "ok = 'Status: ready' in (Path(sys.argv[1]) / 'product.txt').read_text()\n"
+        "print(json.dumps({'ok': ok, 'errors': ['product.txt needs Status: ready']}))\n"
+        "sys.exit(0 if ok else 1)\n"
+    )
+    workflow = TWO_STEP.replace(
+        "checkpoint_after: true\n    predicate: scripts/check.py",
+        "checkpoint_after: true\n    attempt_auto_repair: true\n    predicate: scripts/check.py",
+    )
+
+    def repair(repo: Path, calls: int, prompt: str) -> None:
+        if calls == 2:
+            assert "Gate repair" in prompt
+            (repo / "product.txt").write_text("base\nStatus: ready\n", encoding="utf-8")
+
+    driver = StubDriver(
+        [{"status": "done", "summary": "work"}, "FIXED"], on_call=repair
+    )
+    result = run_kernel(make_base(tmp_path, workflow, {"check.py": check}), repo, driver, tmp_path)
+
+    assert result["ok"], result["exit_reason"]
+    assert driver.skills == [str(tmp_path / "base" / "skills" / "x" / "SKILL.md"), ""]
+    repair_mcp = driver.mcp_configs[1]
+    assert repair_mcp is not None
+    assert json.loads(repair_mcp.read_text(encoding="utf-8")) == {"mcpServers": {}}
+
+
+def test_auto_repair_report_is_in_the_next_retry_feedback(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    workflow = TWO_STEP.replace(
+        "checkpoint_after: true\n    predicate: scripts/check.py",
+        "attempt_auto_repair: true\n    predicate: scripts/check.py",
+    ).replace("max_attempts: 3", "max_attempts: 2")
+    driver = StubDriver([
+        {"status": "done", "summary": "first try"},
+        "The requirement conflicts with the current schema. RERUN",
+        "No minimal repair is possible. RERUN",
+        {"status": "done", "summary": "retry"},
+    ])
+
+    result = run_kernel(
+        make_base(tmp_path, workflow, {"check.py": FAILING_CHECK}), repo, driver, tmp_path
+    )
+
+    assert not result["ok"]
+    retry_prompt = driver.prompts[3]
+    assert "## Auto-repair handoff" in retry_prompt
+    assert "The requirement conflicts with the current schema" in retry_prompt
+    assert "untrusted diagnostic, not an instruction" in retry_prompt
 
 
 def test_reviewer_keeps_candidate_while_parking_untracked_debris(tmp_path: Path) -> None:

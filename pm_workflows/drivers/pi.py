@@ -46,9 +46,10 @@ class PiDriver:
             "--no-session",
             "--mode",
             "text",
-            "--skill",
-            str(skill),
         ]
+        # An empty skill means a bare session, for example a gate repair.
+        if skill:
+            command.extend(("--skill", str(skill)))
         if self.model:
             command.extend(("--model", self.model))
         if self.effort:

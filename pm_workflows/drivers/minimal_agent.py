@@ -31,7 +31,7 @@ class PmCoderDriver:
     def __init__(
         self,
         model: str = "",
-        effort: str = "",
+        effort: str = "xhigh",
         base_url: str = "",
         api_key_env: str = "OPENAI_API_KEY",
         max_turns: int = 80,
@@ -87,7 +87,7 @@ class PmCoderDriver:
                 api_key=os.environ.get(self.api_key_env) or "local",
                 model=self.model or None,
                 mcp_config=mcp_config,
-                enable_thinking=self.effort in {"high", "xhigh", "max", "ultra"},
+                enable_thinking=True, # enable, always use whatever endpoint has
             )
             stdout = str(payload.get("response", ""))
             result_json = extract_json(stdout)

@@ -65,6 +65,7 @@ class JournalEntry:
     run_id: str
     phase: str
     # role | gate | script | human | checkpoint | failure_memory | escalate | loop
+    # | auto_repair
     kind: str
     role: str | None = None
     attempt: int = 0
@@ -277,6 +278,10 @@ class PhaseConfig:
     predicate: str | None = None
     script: str | None = None
     args: list[str] = field(default_factory=list)
+    # gate phases: before routing a failure, try up to
+    # AUTO_REPAIR_ATTEMPTS coding-agent repair sessions that make the tree
+    # pass the failed check.
+    attempt_auto_repair: bool = False
 
     # human phases
     question: str = ""

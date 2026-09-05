@@ -47,7 +47,7 @@ def build_driver(
             effort=effort,
             base_url=base_url,
             api_key_env=api_key_env,
-            max_turns=max_agent_requests or 80,
+            max_turns=max_agent_requests or 0,
             timeout_seconds=timeout_seconds,
         )
     if kind == "python":

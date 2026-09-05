@@ -386,6 +386,7 @@ def _parse_phase(
         predicate=raw.get("predicate"),
         script=raw.get("script"),
         args=[str(a) for a in args],
+        attempt_auto_repair=bool(raw.get("attempt_auto_repair", False)),
         question=raw.get("question", "") or "",
         question_from_result=raw.get("question_from_result", "") or "",
         iterator_source=raw.get("iterator_source"),

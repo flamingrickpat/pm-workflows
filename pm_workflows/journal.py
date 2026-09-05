@@ -233,6 +233,22 @@ class Journal:
                     causes.append(cause)
         return causes
 
+    def active_repair_diagnostics(self, phase: str) -> list[str]:
+        """Return repair reports retained for the next retry of ``phase``."""
+        reports: list[str] = []
+        for entry in self.read_all():
+            if entry.get("kind") != "failure_memory" or entry.get("phase") != phase:
+                continue
+            if entry.get("verdict") == "cleared":
+                reports.clear()
+                continue
+            if entry.get("verdict") != "recorded":
+                continue
+            values = (entry.get("result") or {}).get("repair_diagnostics", [])
+            if isinstance(values, list):
+                reports.extend(str(value) for value in values if str(value).strip())
+        return reports
+
     def phases_with_failure_memory(self) -> list[str]:
         phases: list[str] = []
         for entry in self.read_all():
