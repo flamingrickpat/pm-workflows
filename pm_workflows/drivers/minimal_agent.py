@@ -75,6 +75,7 @@ class PmCoderDriver:
         try:
             payload = run_auto(
                 prompt,
+                skill=skill or None,
                 cwd=work_dir,
                 run_id=f"{run_id}_{attempt}",
                 log_root=(

@@ -2255,10 +2255,10 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
     ) -> str:
         lines = [
             f"You are running one role in a controlled workflow: `{role.name}`.",
-            "",
-            f"Read `{skill_path}` in full before doing anything else, then follow it",
-            "exactly. Perform this role only. Do not take on another role's work.",
-            "",
+            f"You will be provided with a skill/multiple skills, that tell you how to fulfill your role.",
+            f"Perform this role only. Do not take on another role's work.",
+            f"If the skill isn't automatically added to the system prompt or user message, read `{skill_path}`.",
+            f"",
             f"Repository: `{self.workspace}`",
             f"Task id: `{self.task_id}`",
             f"Task folder: `{self.task_dir}`",

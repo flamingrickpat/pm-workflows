@@ -144,9 +144,10 @@ def test_pm_coder_uses_the_deployed_mcp_config(tmp_path: Path, monkeypatch) -> N
         seen.update(prompt=prompt, kwargs=kwargs)
         return {"response": '{"status":"done"}', "tokens_used": {"requests": 1}}
 
-    monkeypatch.setattr("pm_workflows.drivers.minimal_agent.run_auto_sync", fake_run)
+    monkeypatch.setattr("pm_workflows.drivers.minimal_agent.run_auto", fake_run)
     result = MinimalAgentDriver().run_session("run", 1, "skill.md", "do it", work)
     assert seen["kwargs"]["mcp_config"] == mcp
+    assert seen["kwargs"]["skill"] == "skill.md"
     assert result.result_json == {"status": "done"}
 
 
@@ -158,7 +159,7 @@ def test_pm_coder_writes_kernel_artifacts(tmp_path: Path, monkeypatch) -> None:
     def fake_run(prompt, **kwargs):
         return {"response": '{"status":"done","summary":"ok"}', "tokens_used": {"requests": 3}}
 
-    monkeypatch.setattr("pm_workflows.drivers.minimal_agent.run_auto_sync", fake_run)
+    monkeypatch.setattr("pm_workflows.drivers.minimal_agent.run_auto", fake_run)
     result = MinimalAgentDriver(model="qwen").run_session(
         "run",
         1,
@@ -184,7 +185,7 @@ def test_pm_coder_preserves_full_exception_diagnostics(
     def fake_run(prompt, **kwargs):
         raise RuntimeError("diagnostic test failure")
 
-    monkeypatch.setattr("pm_workflows.drivers.minimal_agent.run_auto_sync", fake_run)
+    monkeypatch.setattr("pm_workflows.drivers.minimal_agent.run_auto", fake_run)
     result = MinimalAgentDriver().run_session(
         "run", 1, "skill.md", "do it", work, trace_file=trace
     )
