@@ -151,6 +151,9 @@ class Kernel:
         self.allowed_effects = allowed_effects
         self.require_http_mcp = require_http_mcp
         self.mcp_http_timeout = mcp_http_timeout
+        # >0 while an auto-repair oracle re-executes its node: a failed
+        # re-run must not nest another repair loop inside the first.
+        self._in_repair_rerun = 0
 
         selected_agent = (
             coding_agent
@@ -901,8 +904,27 @@ class Kernel:
         for line in errors[:4]:
             print(f"       {line[:160]}")
 
-        return {"valid": valid, "status": status, "errors": errors,
-                "data": agent.result_json or {}}
+        result = {"valid": valid, "status": status, "errors": errors,
+                  "data": agent.result_json or {}}
+        if (
+            not valid and phase.attempt_auto_repair
+            and not self._in_repair_rerun
+        ):
+            prompt = self._auto_repair_prompt(
+                phase,
+                f"role skill `{skill_path}`",
+                skill_path.read_text(encoding="utf-8", errors="replace"),
+                errors,
+                agent.stdout or "",
+                None,
+            )
+            rerun = lambda: self._execute_role(phase)  # noqa: E731
+            repaired, repair_reports = self._auto_repair(phase, prompt, rerun, errors)
+            if repaired is not None:
+                result = repaired
+                if repair_reports:
+                    result["data"]["repair_reports"] = repair_reports
+        return result
 
     def _driver_for_skill(self, skill_path: Path) -> Any:
         """A `.py` skill always runs in-process, whatever the workflow's agent."""
@@ -1086,7 +1108,22 @@ class Kernel:
             print(f"       {line[:160]}")
         repair_reports: list[str] = []
         if not result.ok and phase.attempt_auto_repair:
-            result, repair_reports = self._auto_repair_gate(phase, path, result)
+            prompt = self._auto_repair_prompt(
+                phase,
+                f"check script `{path}`",
+                Path(path).read_text(encoding="utf-8", errors="replace"),
+                result.errors,
+                result.output.strip(),
+                result.exit_code,
+            )
+            rerun = lambda: run_gate(  # noqa: E731
+                path, self.workspace, self._check_env(), phase.args
+            )
+            repaired, repair_reports = self._auto_repair(
+                phase, prompt, rerun, result.errors
+            )
+            if repaired is not None:
+                result = repaired
         return {
             "valid": result.ok,
             "status": None,
@@ -1094,63 +1131,81 @@ class Kernel:
             "data": {"repair_reports": repair_reports} if repair_reports else {},
         }
 
-    def _auto_repair_gate(
-        self, phase: PhaseConfig, path: Path, result: GateResult
-    ) -> tuple[GateResult, list[str]]:
-        """Try to make a failed check pass before the failure routes.
+    def _auto_repair(
+        self,
+        phase: PhaseConfig,
+        prompt: Callable[[int], str],
+        rerun: Callable[[], Any],
+        errors: list[str],
+    ) -> tuple[Any, list[str]]:
+        """Try to make a failed node pass before its failure routes.
 
-        One small coding-agent session per attempt gets the full gate brief:
-        metadata, the check output, the complete check script, and two equal
-        options — fix the artifact defect, or report the real problem so the
-        failure can rerun with a known cause. The agent's text is journaled
-        but never trusted: only the re-run check decides. After
-        AUTO_REPAIR_ATTEMPTS failures the original failure path runs.
+        One small coding-agent session per attempt gets the full repair
+        brief: metadata, the node's failure output, the complete source of
+        the check or skill that failed, and two equal options — fix the
+        artifact defect, or report the real problem so the failure can
+        rerun with a known cause. The agent's text is journaled but never
+        trusted: `rerun` re-executes the failed node itself and only its
+        outcome decides. Returns (the last re-run outcome, repair reports).
+        After AUTO_REPAIR_ATTEMPTS failures the original failure path runs.
+
+        `_in_repair_rerun` stops a failed re-run from nesting its own
+        repair loop.
         """
         reports: list[str] = []
-        for attempt in range(1, AUTO_REPAIR_ATTEMPTS + 1):
-            print(f"\n>>> {phase.name}  auto-repair attempt {attempt}")
-            self.journal.append(JournalEntry(
-                run_id=self.run_id, phase=phase.name, kind="auto_repair",
-                attempt=attempt, ok=True, verdict="dispatched",
-                item=self.current_item, errors=result.errors,
-            ))
-            item_tag = self._item_tag(phase.name)
-            driver_kind = getattr(self.driver, "kind", "agent")
-            agent = self.driver.run_session(
-                run_id=f"{self.run_id}_{phase.name}{item_tag}_repair{attempt}",
-                attempt=attempt,
-                skill="",
-                prompt=self._auto_repair_prompt(phase, path, result, attempt),
-                work_dir=self.workspace,
-                result_file=(
-                    self.kernel_data / "results"
-                    / f"{phase.name}{item_tag}_repair{attempt}_{driver_kind}.json"
-                ),
-                trace_file=(
-                    self.kernel_data / "traces"
-                    / f"{phase.name}{item_tag}_repair{attempt}_{driver_kind}.jsonl"
-                ),
-                # A repair is deliberately local-only: it may fix repository
-                # metadata, but must not call any workspace MCP capability.
-                mcp_config=self._empty_mcp_config(phase, attempt),
-            )
-            result = run_gate(path, self.workspace, self._check_env(), phase.args)
-            report = (agent.stdout or "").strip()
-            if report:
-                reports.append(report[-4000:])
-            self.journal.append(JournalEntry(
-                run_id=self.run_id, phase=phase.name, kind="auto_repair",
-                attempt=attempt, ok=result.ok,
-                verdict="pass" if result.ok else "fail",
-                item=self.current_item, errors=result.errors,
-                result={"repair_report": report} if report else None,
-                session_ref=agent.session_ref or None,
-                trace_path=agent.trace_path,
-            ))
-            print(f"    -> re-check {'PASS' if result.ok else 'FAIL'}")
-            if result.ok:
-                break
-        return result, reports
+        outcome: Any = None
+        self._in_repair_rerun += 1
+        try:
+            for attempt in range(1, AUTO_REPAIR_ATTEMPTS + 1):
+                print(f"\n>>> {phase.name}  auto-repair attempt {attempt}")
+                self.journal.append(JournalEntry(
+                    run_id=self.run_id, phase=phase.name, kind="auto_repair",
+                    attempt=attempt, ok=True, verdict="dispatched",
+                    item=self.current_item, errors=errors,
+                ))
+                item_tag = self._item_tag(phase.name)
+                driver_kind = getattr(self.driver, "kind", "agent")
+                agent = self.driver.run_session(
+                    run_id=f"{self.run_id}_{phase.name}{item_tag}_repair{attempt}",
+                    attempt=attempt,
+                    skill="",
+                    prompt=prompt(attempt),
+                    work_dir=self.workspace,
+                    result_file=(
+                        self.kernel_data / "results"
+                        / f"{phase.name}{item_tag}_repair{attempt}_{driver_kind}.json"
+                    ),
+                    trace_file=(
+                        self.kernel_data / "traces"
+                        / f"{phase.name}{item_tag}_repair{attempt}_{driver_kind}.jsonl"
+                    ),
+                    # A repair is deliberately local-only: it may fix repository
+                    # metadata, but must not call any workspace MCP capability.
+                    mcp_config=self._empty_mcp_config(phase, attempt),
+                )
+                outcome = rerun()
+                repaired = (
+                    outcome.ok if isinstance(outcome, GateResult)
+                    else bool(outcome.get("valid"))
+                )
+                report = (agent.stdout or "").strip()
+                if report:
+                    reports.append(report[-4000:])
+                self.journal.append(JournalEntry(
+                    run_id=self.run_id, phase=phase.name, kind="auto_repair",
+                    attempt=attempt, ok=repaired,
+                    verdict="pass" if repaired else "fail",
+                    item=self.current_item,
+                    result={"repair_report": report} if report else None,
+                    session_ref=agent.session_ref or None,
+                    trace_path=agent.trace_path,
+                ))
+                print(f"    -> re-check {'PASS' if repaired else 'FAIL'}")
+                if repaired:
+                    break
+        finally:
+            self._in_repair_rerun -= 1
+        return outcome, reports
 
     def _empty_mcp_config(self, phase: PhaseConfig, attempt: int) -> Path:
         """Materialize an explicit empty MCP configuration for a repair."""
@@ -1163,25 +1218,54 @@ class Kernel:
         return path
 
     def _auto_repair_prompt(
-        self, phase: PhaseConfig, path: Path, result: GateResult, attempt: int
-    ) -> str:
-        """The full repair brief: metadata, check output, script, two options."""
-        script_dump = Path(path).read_text(encoding="utf-8", errors="replace")
-        output = result.output.strip() or "\n".join(result.errors) or "(the check printed nothing)"
-        item = self.current_item or "(none — this gate runs at task level)"
-        args = " ".join(phase.args) or "(none)"
+        self,
+        phase: PhaseConfig,
+        what: str,
+        source_dump: str,
+        errors: list[str],
+        output: str,
+        exit_code: int | None,
+    ) -> Callable[[int], str]:
+        """The full repair brief factory: metadata, failure, source, two options."""
+        output = output or "\n".join(errors) or "(the failed node printed nothing)"
+        item = self.current_item or "(none — this phase runs at task level)"
         head = self.checkpoint.current_rev() if self.checkpoint else ""
-        on_pass = (
-            f"the workflow continues with phase '{phase.on_pass}'"
-            if phase.on_pass else "the workflow continues its normal path"
-        )
+        if phase.on_pass:
+            on_pass = f"the workflow continues with phase '{phase.on_pass}'"
+        elif phase.on_invalid or phase.on_status:
+            on_pass = "the workflow routes on the node's reported status"
+        else:
+            on_pass = "the workflow continues its normal path"
         on_fail = self._render_on_fail(phase)
-        verify = self._self_verify_command(path, phase.args)
-        return f"""# Gate repair
+        if phase.kind in ("gate", "script"):
+            node_line = "a workflow gate failed its check"
+            details = (
+                f"- Check arguments: {' '.join(phase.args) or '(none)'}\n"
+                f"- Exit code of the failed run: {exit_code}"
+            )
+            verify = self._self_verify_command(
+                self._resolve_path(phase.predicate or phase.script or ""), phase.args
+            )
+            verify_block = f"""3. Verify it yourself. Run:
 
-A workflow gate failed its check right after a work phase finished. You
-get this one session to handle that failure. Read this brief in full. Do
-not edit anything before you have decided.
+   {verify}
+
+   The check must pass under your own hands. The workflow runs the same
+   check again after you. Your claim is not checked — the tree is."""
+        else:
+            node_line = "a workflow role failed its contract"
+            details = "- The role's declared result contract rejected its output"
+            verify_block = """3. Verify it yourself by inspection: the defect must be
+   gone from the tree, and the role's contract must be satisfiable with
+   the tree as you leave it. The workflow re-runs the role after you.
+   Your claim is not checked — the tree is."""
+
+        def brief(attempt: int) -> str:
+            return f"""# Auto repair
+
+{node_line.capitalize()} right after a work phase finished. You get this
+one session to handle that failure. Read this brief in full. Do not edit
+anything before you have decided.
 
 ## The situation
 
@@ -1190,34 +1274,33 @@ not edit anything before you have decided.
 - Repository: {self.workspace}
 - Work item: {item}
 - This is repair attempt {attempt} of {AUTO_REPAIR_ATTEMPTS}.
-- The phase before this gate produced the current tree.
+- The phase that produced the current tree is the failure's subject.
 
-## The gate
+## The node
 
-- Gate name: {phase.name}
-- Check script: {path}
-- Check arguments: {args}
-- Exit code of the failed run: {result.exit_code}
-- If the gate passes: {on_pass}.
-- If the gate still fails after every repair attempt: {on_fail}.
+- Phase name: {phase.name}
+- Failed {what}
+{details}
+- If the node passes after repair: {on_pass}.
+- If it still fails after every repair attempt: {on_fail}.
 
-## The output of the failed check
+## The failure output
 
 ```
 {output}
 ```
 
-## The check script (complete)
+## The source that failed (complete)
 
-```python
-{script_dump}
+```
+{source_dump}
 ```
 
 ## Decide first, then act
 
 Answer one question before any edit:
 
-    Can I make this check pass with a few small file edits,
+    Can I make this node pass with a few small file edits,
     without hiding a real problem?
 
 Yes, and you verified it yourself → FIX. No, or not sure → RERUN.
@@ -1225,26 +1308,23 @@ Yes, and you verified it yourself → FIX. No, or not sure → RERUN.
 ## FIX
 
 Choose FIX only when the defect is a missing or malformed artifact: an
-index file, a record file, a wrong name or path. Do:
+index file, a record file, a clobbered immutable file, a wrong name or
+path. Do:
 
 1. Confirm the defect in the tree.
-2. Make the smallest fix that satisfies the check's real intent. If the
-   check wants an index that lists a directory's artifacts, write a real
-   index of those artifacts.
-3. Verify it yourself. Run:
-
-   {verify}
-
-   The check must pass under your own hands. The workflow runs the same
-   check again after you. Your claim is not checked — the tree is.
+2. Make the smallest fix that satisfies the node's real intent. If the
+   node wants an index that lists a directory's artifacts, write a real
+   index of those artifacts. If a file must match an earlier committed
+   version, restore that exact version from git history.
+{verify_block}
 4. Amend the last commit{' (' + head[:12] + ')' if head else ''}. The fix
    belongs to the work it repairs. Do not create a new commit on top.
 
 Do not:
 - change `state.md` in the task folder — the controller owns it;
-- change the check script, or any other file in its directory;
-- weaken, skip, or bypass the check;
-- create empty files whose only purpose is to satisfy the check;
+- change the check script or skill, or any other file in its directory;
+- weaken, skip, or bypass the check or contract;
+- create empty files whose only purpose is to satisfy the node;
 - start new work — no features, no refactors, no cleanups;
 - touch anything outside the repository.
 
@@ -1253,14 +1333,14 @@ Do not:
 Choose RERUN when the failure needs real design or implementation work,
 when the previous phase produced something fundamentally wrong that a
 patch from you would only hide, or when you do not understand the failure
-after reading the script and the tree. When in doubt, report.
+after reading the source and the tree. When in doubt, report.
 
 Do: change nothing. Leave the tree exactly as it is. No commits, no
 staging, no edits.
 
 Then write a report with these five parts:
 
-1. What the check demands, in your own words.
+1. What the node demands, in your own words.
 2. What the previous phase actually produced. Name the files and quote
    the relevant state.
 3. The actual problem — the root cause, not the symptom. Name the
@@ -1275,6 +1355,8 @@ avoid work.
 
 Finish with exactly one line: FIXED, or RERUN. Put the report above it.
 """
+
+        return brief
 
     def _render_on_fail(self, phase: PhaseConfig) -> str:
         """One sentence about where a still-failing gate routes."""
@@ -1525,7 +1607,27 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
             f"\n>>> {phase.name}  workflow={phase.workflow}  attempt {attempt}"
             f"\n    -> status={status or 'INVALID CHILD RESULT'} children={len(receipts)}"
         )
-        return {"valid": valid, "status": status, "errors": errors, "data": result}
+        out = {"valid": valid, "status": status, "errors": errors, "data": result}
+        if (
+            not valid and phase.attempt_auto_repair
+            and not self._in_repair_rerun
+        ):
+            prompt = self._auto_repair_prompt(
+                phase,
+                f"child workflow `{phase.workflow}`",
+                "(the child re-runs as a fresh kernel in its own task folder; "
+                "the failure detail is in the error output above)",
+                errors,
+                "",
+                None,
+            )
+            rerun = lambda: self._execute_workflow(phase)  # noqa: E731
+            repaired, repair_reports = self._auto_repair(phase, prompt, rerun, errors)
+            if repaired is not None:
+                out = repaired
+                if repair_reports:
+                    out["data"]["repair_reports"] = repair_reports
+        return out
 
     def _child_items(self, phase: PhaseConfig) -> list[Any | None]:
         if phase.foreach is None:

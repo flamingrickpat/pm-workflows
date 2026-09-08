@@ -13,6 +13,7 @@ from pathlib import Path
 import pytest
 
 from pm_workflows.kernel import Kernel
+from pm_workflows.manifest import ManifestError
 from pm_workflows.protocol import AgentResult
 from pm_workflows.ratelimit import TokenLimitError
 
@@ -211,7 +212,7 @@ def test_auto_repair_uses_empty_mcp_config_and_hands_off_its_report(tmp_path: Pa
 
     def repair(repo: Path, calls: int, prompt: str) -> None:
         if calls == 2:
-            assert "Gate repair" in prompt
+            assert "Auto repair" in prompt
             (repo / "product.txt").write_text("base\nStatus: ready\n", encoding="utf-8")
 
     driver = StubDriver(
@@ -1239,3 +1240,57 @@ def test_state_md_survives_a_revert(tmp_path: Path) -> None:
     state = repo / "agents" / "tasks" / TASK_ID / "state.md"
     assert state.is_file(), "state.md was destroyed by a revert"
     assert "Workflow state" in state.read_text(encoding="utf-8")
+
+
+def test_auto_repair_repairs_a_failing_role_phase(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    workflow = TWO_STEP.replace(
+        "  - name: work\n    kind: role\n    role: worker\n",
+        "  - name: work\n    kind: role\n    role: worker\n    attempt_auto_repair: true\n",
+    )
+    base = make_base(tmp_path, workflow, {"check.py": PASSING_CHECK})
+
+    repair_prompts: list[str] = []
+
+    def capture(repo_: Path, calls: int, prompt: str) -> None:
+        if calls == 2:
+            repair_prompts.append(prompt)
+
+    # 1: the role violates its contract. 2: the repair session. 3: the re-run.
+    driver = StubDriver(
+        ["not a result object", "FIXED", {"status": "done", "summary": "did it"}],
+        on_call=capture,
+    )
+    result = run_kernel(base, repo, driver, tmp_path)
+
+    assert result["ok"], result["exit_reason"]
+    assert driver.calls == 3
+    assert driver.skills[1] == "", "the repair session runs without a skill"
+    prompt = repair_prompts[0]
+    assert "Auto repair" in prompt
+    assert "role skill" in prompt
+    assert "# skill" in prompt, "the brief dumps the failing skill's source"
+
+
+def test_auto_repair_on_a_loop_is_a_logic_error(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    workflow = LOOP.replace(
+        "    kind: loop\n    iterator_source: pending_work_items\n",
+        "    kind: loop\n    attempt_auto_repair: true\n    iterator_source: pending_work_items\n",
+    )
+    base = make_base(tmp_path, workflow, {"check.py": PASSING_CHECK})
+
+    with pytest.raises(ManifestError, match="attempt_auto_repair"):
+        run_kernel(base, repo, StubDriver([]), tmp_path)
+
+
+def test_auto_repair_on_a_human_phase_is_a_logic_error(tmp_path: Path) -> None:
+    repo = make_repo(tmp_path)
+    workflow = HUMAN.replace(
+        "    kind: human\n    question: fallback question\n",
+        "    kind: human\n    attempt_auto_repair: true\n    question: fallback question\n",
+    )
+    base = make_base(tmp_path, workflow, {"check.py": PASSING_CHECK})
+
+    with pytest.raises(ManifestError, match="attempt_auto_repair"):
+        run_kernel(base, repo, StubDriver([]), tmp_path)

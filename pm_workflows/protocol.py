@@ -278,9 +278,10 @@ class PhaseConfig:
     predicate: str | None = None
     script: str | None = None
     args: list[str] = field(default_factory=list)
-    # gate phases: before routing a failure, try up to
-    # AUTO_REPAIR_ATTEMPTS coding-agent repair sessions that make the tree
-    # pass the failed check.
+    # gate / script / role / workflow phases: before routing a failure, try
+    # up to AUTO_REPAIR_ATTEMPTS coding-agent repair sessions, re-executing
+    # the failed node itself after each one to decide. Rejected at load on
+    # loop and human phases, which have no deterministic re-run oracle.
     attempt_auto_repair: bool = False
 
     # human phases

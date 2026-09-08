@@ -452,6 +452,16 @@ def _validate(workflow: Workflow, extensions: PhaseExtensionRegistry) -> None:
                     f"{path}: phase '{phase.name}' suspension requires resume_at"
                 )
 
+        if phase.attempt_auto_repair and phase.kind in {"loop", "human"}:
+            raise ManifestError(
+                f"{path}: phase '{phase.name}' sets attempt_auto_repair on a "
+                f"'{phase.kind}' phase, but there is nothing deterministic to "
+                "re-run after a repair — a loop re-decides per iteration and a "
+                "human is the oracle. Auto-repair is only meaningful where the "
+                "kernel can re-execute the node to re-decide success: gate, "
+                "script, role, workflow."
+            )
+
         if phase.kind == "role":
             if not phase.role:
                 raise ManifestError(f"{path}: role phase '{phase.name}' names no role")
