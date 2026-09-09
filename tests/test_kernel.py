@@ -14,7 +14,7 @@ import pytest
 
 from pm_workflows.kernel import Kernel
 from pm_workflows.manifest import ManifestError
-from pm_workflows.protocol import AgentResult
+from pm_workflows.protocol import AgentResult, JournalEntry
 from pm_workflows.ratelimit import TokenLimitError
 
 TASK_ID = "T-1"
@@ -195,6 +195,38 @@ def test_declared_status_routes_to_the_declared_phase(tmp_path: Path) -> None:
     kinds = [(e["phase"], e["kind"], e.get("verdict")) for e in _journal(tmp_path)]
     assert ("work", "role", "done") in kinds
     assert ("check", "gate", "pass") in kinds
+
+
+def test_workflow_attempt_scope_resets_for_a_new_selected_item(tmp_path: Path) -> None:
+    """Child retries are scoped to the selected logical work item, not the run."""
+    repo = make_repo(tmp_path)
+    workflow = TWO_STEP.replace(
+        "  - name: work\n    kind: role\n    role: worker\n",
+        "  - name: work\n    kind: workflow\n    workflow: child\n"
+        "    task:\n      id: ${TASK_ID}.child\n"
+        "      attempt_scope: selection.id\n"
+        "      input:\n        selection:\n          from: ${TASK_DIR}/selection.json#/selection\n"
+        "    result: {statuses: [done]}\n",
+    ).replace("      done: check\n      again: work", "      done: check")
+    base = make_base(tmp_path, workflow, {"check.py": PASSING_CHECK})
+    selection = repo / "agents" / "tasks" / TASK_ID / "selection.json"
+    selection.parent.mkdir(parents=True)
+    selection.write_text(json.dumps({"selection": {"id": "WI-03b1"}}))
+    kernel = Kernel(
+        manifest_path=base / "coding" / "w.workflow.md", workspace=repo,
+        task_id=TASK_ID, task_text="t", base_dir=base,
+        kernel_data_root=tmp_path / "kernel_data", driver=StubDriver([]),
+    )
+    phase = kernel.manifest.phase_by_name("work")
+    assert kernel._workflow_attempt_scope(phase) == "WI-03b1"
+    kernel.journal.append(JournalEntry(
+        run_id=TASK_ID, phase="work", kind="workflow", attempt=1,
+        ok=True, item="WI-03b1",
+    ))
+    selection.write_text(json.dumps({"selection": {"id": "WI-03b2"}}))
+    assert kernel._workflow_attempt_scope(phase) == "WI-03b2"
+    assert kernel.journal.attempts_for_phase("work", item="WI-03b2") == 0
+    assert kernel.phase_attempts("work") == 0
 
 
 def test_auto_repair_uses_empty_mcp_config_and_hands_off_its_report(tmp_path: Path) -> None:

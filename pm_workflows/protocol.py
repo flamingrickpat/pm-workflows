@@ -185,6 +185,10 @@ class ChildTaskConfig:
     """Task identity and explicit inputs for one child workflow invocation."""
 
     id: str = ""
+    # A field in the resolved input that identifies the logical unit of work.
+    # The kernel keeps its durable invocation sequence globally unique, while
+    # retry numbering starts again for each distinct value of this field.
+    attempt_scope: str = ""
     input: dict[str, Any] = field(default_factory=dict)
 
 

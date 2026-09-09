@@ -585,6 +585,7 @@ class Kernel:
             return False
 
         loop = self.manifest.loop_containing(phase.name)
+        scope_item = self._item_scope(phase.name)
         if loop is not None:
             limit = loop.max_iterations
             executed = self.journal.attempts_for_phase(phase.name, item=self.current_item)
@@ -592,8 +593,8 @@ class Kernel:
             setting = f"loop '{loop.name}' max_iterations"
         else:
             limit = self.manifest.failure_policy.max_attempts_per_phase
-            executed = self.journal.attempts_for_phase(phase.name)
-            scope = ""
+            executed = self.journal.attempts_for_phase(phase.name, item=scope_item)
+            scope = f"for {scope_item}" if scope_item else ""
             setting = "max_attempts_per_phase"
 
         if executed < limit:
@@ -621,6 +622,9 @@ class Kernel:
         """
         if self.manifest.loop_containing(phase_name) is not None:
             return self.current_item
+        phase = self.manifest.phase_by_name(phase_name)
+        if phase and phase.kind == "workflow" and phase.task and phase.task.attempt_scope:
+            return self._workflow_attempt_scope(phase)
         return None
 
     def _item_tag(self, phase_name: str) -> str:
@@ -1530,7 +1534,9 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
 
     def _execute_workflow(self, phase: PhaseConfig) -> dict[str, Any]:
         """Invoke one or more statically named children in fresh kernel runs."""
-        attempt = self.journal.attempts_for_phase(phase.name, item=self._item_scope(phase.name)) + 1
+        attempt_scope = self._workflow_attempt_scope(phase)
+        attempt = self.journal.attempts_for_phase(phase.name, item=attempt_scope) + 1
+        sequence = self.journal.attempts_for_phase(phase.name) + 1
         limits = phase.limits
         max_attempts = limits.max_attempts if limits else 1
         if attempt > max_attempts:
@@ -1567,7 +1573,9 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
         try:
             items = self._child_items(phase)
             receipts = [
-                self._run_child(phase, attempt, index, item, remaining)
+                self._run_child(
+                    phase, attempt, index, item, remaining, attempt_scope, sequence
+                )
                 for index, item in enumerate(items, start=1)
             ]
             errors = [
@@ -1588,14 +1596,19 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
             valid = False
             errors = [f"{type(exc).__name__}: {exc}"]
 
-        result = {"children": receipts, "status": status}
+        result = {
+            "children": receipts,
+            "status": status,
+            "sequence": sequence,
+            "attempt_scope": attempt_scope,
+        }
         artifacts = [
             artifact for receipt in receipts for artifact in receipt.get("artifacts", [])
         ]
         self.journal.append(JournalEntry(
             run_id=self.run_id, phase=phase.name, kind="workflow", attempt=attempt,
             ok=valid, verdict=status or "invalid_child_result", status=status,
-            errors=errors, result=result, artifacts=artifacts,
+            errors=errors, result=result, artifacts=artifacts, item=attempt_scope,
         ))
         receipt_dir = self.kernel_data / "child-receipts" / phase.name
         receipt_dir.mkdir(parents=True, exist_ok=True)
@@ -1655,6 +1668,8 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
         index: int,
         item: Any | None,
         depth_remaining: int,
+        attempt_scope: str | None,
+        sequence: int,
     ) -> dict[str, Any]:
         task = phase.task
         result_contract = phase.child_result
@@ -1676,6 +1691,10 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
             # template that does not itself vary per item would otherwise
             # collide between two items' first attempt at this same phase.
             configured_task_id = f"{configured_task_id}.{self._safe_name(Path(outer_item).name)}"
+        if attempt_scope:
+            configured_task_id = (
+                f"{configured_task_id}.__item_{self._safe_name(attempt_scope)}"
+            )
         child_task_id = self._child_task_id(
             self.workspace / "agents" / "tasks",
             configured_task_id,
@@ -1684,7 +1703,8 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
         )
         invocation = (
             f"{self._safe_name(phase.name)}{self._item_tag(phase.name)}"
-            f"-{attempt:04d}-{index:04d}"
+            f"{('_' + self._safe_name(attempt_scope)) if attempt_scope else ''}"
+            f"-sequence{sequence:04d}-attempt{attempt:04d}-{index:04d}"
         )
         child_root = self.kernel_data / "children" / invocation
         durable_receipt = child_root / "receipt.json"
@@ -1780,6 +1800,8 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
             "configured_task_id": configured_task_id,
             "task_id": child_task_id,
             "item_id": stable_id if phase.foreach else None,
+            "attempt_scope": attempt_scope,
+            "sequence": sequence,
             "status": status,
             "raw_status": raw_status,
             "ok": status is not None,
@@ -1801,6 +1823,25 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
         )
         temporary.replace(durable_receipt)
         return receipt
+
+    def _workflow_attempt_scope(self, phase: PhaseConfig) -> str | None:
+        """Return the configured logical-work key for a child invocation.
+
+        This is intentionally declared by the workflow instead of inferred
+        from a particular planner's JSON shape.  It lets journals keep a
+        global history while a new selected work item begins at attempt one.
+        """
+        task = phase.task
+        if task is None or not task.attempt_scope:
+            return self._item_scope(phase.name)
+        resolved = self._resolve_child_value(task.input, {})
+        value = dotted(resolved, task.attempt_scope)
+        if not isinstance(value, (str, int, float)) or not str(value).strip():
+            raise ManifestError(
+                f"workflow phase '{phase.name}' attempt_scope "
+                f"'{task.attempt_scope}' must resolve to a nonempty scalar"
+            )
+        return str(value)
 
     def _resolve_child_value(self, value: Any, variables: dict[str, Any]) -> Any:
         expanded = expand_runtime(value, variables)

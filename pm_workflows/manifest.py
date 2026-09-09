@@ -254,6 +254,7 @@ def _parse_child_fields(raw: dict[str, Any], path: Path, name: str) -> dict[str,
     return {
         "task": ChildTaskConfig(
             id=str(task_raw.get("id", "")),
+            attempt_scope=str(task_raw.get("attempt_scope", "")),
             input=_mapping(task_raw.get("input"), path, f"phase '{name}' task.input"),
         ) if task_raw else None,
         "workspace": ChildWorkspaceConfig(
