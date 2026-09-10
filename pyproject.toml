@@ -12,6 +12,7 @@ requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.27,<1",
     "pm-coder @ git+https://github.com/flamingrickpat/pm-coder.git@main",
+    "pydantic-ai-slim[openai,mcp]==2.27.0",
     "PyYAML>=6,<7",
 ]
 
