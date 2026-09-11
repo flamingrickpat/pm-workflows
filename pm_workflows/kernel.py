@@ -864,20 +864,21 @@ class Kernel:
                 phase, role, attempt
             )
 
+        corrections = 0
+        next_prompt = prompt
         while True:
             try:
                 agent = driver.run_session(
                     run_id=role_run_id,
                     attempt=attempt,
                     skill=str(skill_path),
-                    prompt=prompt,
+                    prompt=next_prompt,
                     work_dir=self.workspace,
                     tools=role.tools,
                     result_file=result_file,
                     trace_file=trace_file,
                     **session_options,
                 )
-                break
             except TokenLimitError as limit:
                 self.journal.append(JournalEntry(
                     run_id=self.run_id, phase=phase.name, kind="rate_limit",
@@ -885,6 +886,26 @@ class Kernel:
                     verdict="usage_limit", errors=[str(limit)[-500:]],
                 ))
                 raise
+
+            status, errors = self._read_contract(role, agent)
+
+            if (
+                    status is not None
+                    or agent.error
+                    or driver_kind != "pm-coder"
+                    or corrections >= 5
+            ):
+                break
+
+            corrections += 1
+            next_prompt = (
+                    "Your final output failed validation:\n"
+                    + "\n".join(f"- {error}" for error in errors)
+                    + "\n\nReturn the corrected complete JSON object only. "
+                      "Use the work and evidence already in this conversation. "
+                      "Do not modify files, rerun tests, or create commits.\n\n"
+                    + self._contract_text(role)
+            )
 
         status, errors = self._read_contract(role, agent)
         candidate_rev = self.checkpoint.current_rev() if self.checkpoint else None
