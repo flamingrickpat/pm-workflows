@@ -1427,8 +1427,8 @@ wheels = [
 
 [[package]]
 name = "pm-coder"
-version = "0.6.3"
-source = { git = "https://github.com/flamingrickpat/pm-coder.git?rev=main#d685df4b2c65725098ab90c94a3603b2e5f423a0" }
+version = "0.7.0"
+source = { git = "https://github.com/flamingrickpat/pm-coder.git?rev=main#810a79fe223419be2d28461fb03c80f1ba8947ed" }
 dependencies = [
     { name = "just-bash" },
     { name = "pydantic" },
@@ -1438,7 +1438,7 @@ dependencies = [
 
 [[package]]
 name = "pm-workflows"
-version = "0.2.0"
+version = "0.3.0"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
