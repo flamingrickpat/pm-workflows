@@ -58,6 +58,7 @@ from .protocol import (
 )
 from .python_role import RoleContext
 from .ratelimit import TokenLimitError
+from .runtime import WorkflowRuntime, WorkflowTerminated
 
 WORK_ITEM_GLOB = "WI-*.md"
 
@@ -96,6 +97,7 @@ class Kernel:
         resource_resolver: Callable[[str, str, Path, Path], Path] | None = None,
         external_answer_root: Path | None = None,
         human_resolution: str | None = None,
+        runtime: WorkflowRuntime | None = None,
     ) -> None:
         self.manifest_path = Path(manifest_path)
         self.workspace = Path(workspace).resolve()
@@ -126,6 +128,7 @@ class Kernel:
         # the controller can route questions through conversations while
         # standalone execution keeps its declared behavior.
         self.human_resolution = human_resolution
+        self.runtime = runtime
 
         self._variables = {
             "TASK_ID": task_id,
@@ -382,6 +385,30 @@ class Kernel:
         print(f"{'=' * 68}\n")
         return summary
 
+    def _check_cancelled(self) -> bool:
+        """True when the invocation's stop event is set."""
+        if self.runtime is None:
+            return False
+        return self.runtime.stop_event.is_set()
+
+    def _terminate(self, started_at: float) -> StepResult:
+        """Mark this invocation terminated once and return its terminal state."""
+        if self.exit_reason != "terminated":
+            self.exit_reason = "terminated"
+            self._next_phase_name = None
+            self._finished = True
+            self.journal.append(JournalEntry(
+                run_id=self.run_id, phase="", kind="termination", ok=False,
+                verdict="terminated", status="terminated",
+            ))
+            self._render_state_md("finished")
+        return self._step_result(
+            phase=None,
+            result={"valid": False, "status": "terminated", "data": {}, "errors": []},
+            attempt=0,
+            started_at=started_at,
+        )
+
     @property
     def pending_phase_name(self) -> str | None:
         """Return the phase that the next ``step()`` call will execute."""
@@ -409,9 +436,14 @@ class Kernel:
                 "after the external receipt is durable"
             )
         if self._finished:
+            if self.exit_reason == "terminated":
+                return self._terminate(started_at)
             return self._step_result(
                 phase=None, result=None, attempt=0, started_at=started_at
             )
+
+        if self._check_cancelled():
+            return self._terminate(started_at)
 
         self._reload_manifest()
         if not self._step_started:
@@ -432,6 +464,9 @@ class Kernel:
                 phase=None, result=None, attempt=0, started_at=started_at
             )
 
+        if self._check_cancelled():
+            return self._terminate(started_at)
+
         if self._over_phase_budget(phase):
             self._next_phase_name = None
             self._finished = True
@@ -447,6 +482,8 @@ class Kernel:
 
         try:
             result = self._execute_phase(phase)
+        except WorkflowTerminated:
+            return self._terminate(started_at)
         except TokenLimitError as limit:
             self.exit_reason = (
                 f"{phase.name}: {limit.agent_kind} usage limit; rerun this "
@@ -469,6 +506,9 @@ class Kernel:
                 ),
                 started_at=started_at,
             )
+
+        if self._check_cancelled():
+            return self._terminate(started_at)
 
         if result["valid"] and phase.checkpoint_after:
             self._accept(
@@ -848,6 +888,7 @@ class Kernel:
                 prompt=prompt, task_text=self.task_text,
                 current_item=self.current_item, feedback=feedback, answer=answer,
                 tools=list(role.tools), result_file=result_file, trace_file=trace_file,
+                runtime=self.runtime,
             )
         if self.allowed_mcp is not None:
             if not getattr(driver, "supports_explicit_mcp_config", False):
@@ -1789,6 +1830,7 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
             resource_resolver=self.resource_resolver,
             external_answer_root=self.external_answer_root,
             human_resolution=self.human_resolution,
+            runtime=self.runtime,
         )
         summary = child.run()
         raw_status: Any = summary.get("terminal_status")

@@ -32,6 +32,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .runtime import WorkflowRuntime
+
 
 @dataclass
 class RoleContext:
@@ -61,3 +63,4 @@ class RoleContext:
     tools: list[str] = field(default_factory=list)
     result_file: Path | None = None
     trace_file: Path | None = None
+    runtime: WorkflowRuntime | None = None

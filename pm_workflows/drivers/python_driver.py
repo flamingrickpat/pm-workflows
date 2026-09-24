@@ -15,6 +15,7 @@ from typing import Any
 
 from ..protocol import AgentResult
 from ..python_role import RoleContext
+from ..runtime import WorkflowTerminated
 from .common import trace_write, write_result_artifact
 
 ENTRY_POINT = "run"
@@ -95,7 +96,12 @@ class PythonDriver:
                     f"'{ENTRY_POINT}(context)' entry point"
                 )
             result = entry(context)
+        except WorkflowTerminated:
+            raise
         except Exception as exc:  # arbitrary code, arbitrary failure
+            runtime = context.runtime
+            if runtime is not None and runtime.propagate_python_errors:
+                raise
             return None, f"{type(exc).__name__}: {exc}\n{traceback.format_exc()}"
         finally:
             sys.modules.pop(module_name, None)
