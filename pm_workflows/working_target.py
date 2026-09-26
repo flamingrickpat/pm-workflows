@@ -17,6 +17,17 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
+
+
+@dataclass(frozen=True)
+class AgentTarget:
+    """Explicit host cwd or virtual machine and user for all coder tools."""
+
+    cwd: Path
+    bash_machine: Any = None
+    user: str = "user"
 
 
 @dataclass(frozen=True)
@@ -28,6 +39,10 @@ class CommandResult:
 
 class WorkingEnvironment(ABC):
     """One invocation-scoped read/write/exec view of a working target."""
+
+    def agent_target(self, artifact_workspace: Path) -> AgentTarget:
+        """Bind agent tools explicitly. Python-only environments need no binding."""
+        raise NotImplementedError("This working environment does not support agents.")
 
     @abstractmethod
     def read_text(self, path: str) -> str:

@@ -1,15 +1,17 @@
 """Driver adapter for the separately packaged :mod:`pm_coder` agent."""
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import traceback
 from pathlib import Path
 from typing import Any
 
-from pm_coder import run_auto
+from pm_coder import run_auto, async_run_auto, async_run_auto_with_bash_machine
 
 from ..protocol import AgentResult
+from ..runtime import WorkflowRuntime, WorkflowTerminated
 from .common import deployed_mcp_config, extract_json, trace_write
 
 
@@ -59,44 +61,62 @@ class PmCoderDriver:
         result_file: Path | None = None,
         trace_file: Path | None = None,
         mcp_config: Path | None = None,
+        runtime: WorkflowRuntime | None = None,
     ) -> AgentResult:
+        if runtime is not None:
+            runtime.check_cancelled()
+            if runtime.agent_model is None:
+                raise ValueError("A runtime agent requires an explicit model connection.")
+            target = runtime.environment.agent_target(Path(work_dir).resolve())
         work_dir = Path(work_dir).resolve()
         mcp_config = (
-            Path(mcp_config) if mcp_config is not None else deployed_mcp_config(work_dir)
+            Path(mcp_config) if mcp_config is not None
+            else deployed_mcp_config(work_dir) if runtime is None else None
         )
         trace_write(trace_file, {
             "event": "start",
             "agent": self.kind,
-            "model": self.model,
+            "model": runtime.agent_model.model if runtime is not None else self.model,
             "effort": self.effort,
             "skill": skill,
             "work_dir": str(work_dir),
         })
         try:
-            payload = run_auto(
-                prompt,
-                skill=skill or None,
-                cwd=work_dir,
-                run_id=f"{run_id}_{attempt}",
-                log_root=(
-                    self.log_root
-                    or (trace_file.parent.parent / "pm-coder")
-                    if trace_file
-                    else Path.home() / ".pm" / "pm-coder"
-                ),
-                base_url=self.base_url,
-                api_key=os.environ.get(self.api_key_env) or "local",
-                model=self.model or None,
-                mcp_config=mcp_config,
-                enable_thinking=True, # enable, always use whatever endpoint has
-            )
+            if runtime is not None:
+                payload = asyncio.run(_run_bound_agent(
+                    runtime, target, prompt, skill, f"{run_id}_{attempt}",
+                    self.log_root or (trace_file.parent.parent / "pm-coder" if trace_file else work_dir / "pm-coder"),
+                    Path(mcp_config) if mcp_config is not None else None,
+                ))
+            else:
+                payload = run_auto(
+                    prompt,
+                    skill=skill or None,
+                    cwd=work_dir,
+                    run_id=f"{run_id}_{attempt}",
+                    log_root=(
+                        self.log_root
+                        or (trace_file.parent.parent / "pm-coder")
+                        if trace_file
+                        else Path.home() / ".pm" / "pm-coder"
+                    ),
+                    base_url=self.base_url,
+                    api_key=os.environ.get(self.api_key_env) or "local",
+                    model=self.model or None,
+                    mcp_config=mcp_config,
+                    enable_thinking=True, # enable, always use whatever endpoint has
+                )
             stdout = str(payload.get("response", ""))
             result_json = extract_json(stdout)
             usage = payload.get("tokens_used", {})
             session_ref = str(payload.get("run_id", "") or "")
             error = None
             exit_code = 0
-        except Exception as exc:  # Agent failures are normalized for the kernel.
+        except WorkflowTerminated:
+            raise
+        except Exception as exc:  # Standalone agent failures retain legacy normalization.
+            if runtime is not None:
+                raise
             if self.fatal_provider_exhaustion and _is_provider_exhaustion(exc):
                 raise ProviderExhaustedError(
                     f"pm-coder exhausted provider retries: "
@@ -162,3 +182,36 @@ def _is_provider_exhaustion(exc: BaseException) -> bool:
 
 # Compatibility name for workflow manifests that still say ``minimal_agent``.
 MinimalAgentDriver = PmCoderDriver
+
+
+async def _run_bound_agent(runtime, target, prompt, skill, run_id, log_root, mcp_config):
+    """Cancel supported asynchronous I/O and await session cleanup before return.
+
+    Synchronous tool effects remain cooperative and cannot be undone.
+    Explicit settings prevent endpoint discovery from blocking cancellation.
+    """
+    connection = runtime.agent_model
+    if skill:
+        prompt = Path(skill).read_text(encoding="utf-8") + "\n\n" + prompt
+    kwargs = dict(
+        cwd=target.cwd, run_id=run_id, log_root=log_root,
+        base_url=connection.base_url, model=connection.model,
+        api_key=connection.api_key, context_window=connection.context_window,
+        enable_thinking=connection.enable_thinking, live_test=connection.live_test,
+        workspace_discovery=False, mcp_config=mcp_config,
+    )
+    call = (
+        async_run_auto(prompt, **kwargs) if target.bash_machine is None
+        else async_run_auto_with_bash_machine(prompt, target.bash_machine, user=target.user, **kwargs)
+    )
+    task = asyncio.create_task(call)
+    try:
+        while not task.done():
+            runtime.check_cancelled()
+            await asyncio.wait({task}, timeout=0.05)
+        runtime.check_cancelled()
+        return task.result().as_dict()
+    finally:
+        if not task.done():
+            task.cancel()
+        await asyncio.gather(task, return_exceptions=True)

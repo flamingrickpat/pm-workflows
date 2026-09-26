@@ -832,6 +832,8 @@ class Kernel:
 
     def _execute_role(self, phase: PhaseConfig) -> dict[str, Any]:
         role = self.manifest.roles[phase.role or ""]
+        if self.runtime is not None and role.mcp and self.allowed_mcp is None:
+            raise ManifestError("Runtime roles require explicit MCP grants before requesting services.")
         attempt = self.journal.attempts_for_phase(phase.name, item=self._item_scope(phase.name)) + 1
         if self.allowed_mcp is not None:
             denied = sorted(set(role.mcp) - self.allowed_mcp)
@@ -879,6 +881,8 @@ class Kernel:
             / f"{phase.name}{item_tag}_attempt{attempt}_{driver_kind}.json"
         )
         session_options: dict[str, Any] = {}
+        if driver_kind == "pm-coder" and self.runtime is not None:
+            session_options["runtime"] = self.runtime
         if isinstance(driver, PythonDriver):
             session_options["context"] = RoleContext(
                 run_id=role_run_id,

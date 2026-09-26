@@ -10,6 +10,22 @@ the GitHub repository.
 Workflow metadata is stored outside the target repository in
 `~/.pm/pm-workflows/<timestamp>_<task-id>/`.
 
+## Runtime agent targets
+
+`WorkflowRuntime.agent_model` accepts an explicit `AgentModel` connection and context window.
+The pm-coder driver passes that connection to each role without changing environment variables.
+The environment's `agent_target(artifact_workspace)` method supplies an `AgentTarget`.
+This target selects either a host folder or a BashMachine and virtual user.
+All coder file tools use that target. Kernel journals remain on disk.
+
+Runtime roles receive their skill text directly. Automatic host instructions, skills, and MCP discovery are disabled.
+Roles that request MCP services require explicit grants. Dynamic service binding remains an embedder responsibility.
+The driver checks the cancellation event during inference and waits for asynchronous session cleanup.
+Synchronous tool effects remain cooperative. Cancellation cannot undo a completed effect.
+Runtime exceptions reach the caller. Standalone driver calls retain their previous error normalization.
+
+Run `tests/test_agent_runtime_live.py` to check both targets and cancellation with a real Qwen endpoint.
+
 ## Attempt counting inside a loop
 
 A phase's `on_invalid`/`on_failure` `max_attempts`, and the attempt number a
