@@ -41,7 +41,21 @@ class WorkflowRuntime:
     tools: Mapping[str, Callable[..., object]]
     propagate_python_errors: bool = False
     agent_model: AgentModel | None = None
+    # Named scoped services the run may use over MCP. The application starts
+    # the listeners and supplies connection descriptors here; the kernel only
+    # selects and writes a per-run config. ``None`` means no runtime services
+    # (the legacy shared ``.mcp.json`` discovery still applies).
+    mcp_servers: Mapping[str, Mapping[str, Any]] | None = None
+    # Opens the runtime for one child invocation. ``None`` reuses this runtime
+    # so existing embedders keep their single-environment behavior.
+    child_factory: Callable[[str], "WorkflowRuntime"] | None = None
 
     def check_cancelled(self) -> None:
         if self.stop_event.is_set():
             raise WorkflowTerminated()
+
+    def child(self, scope: str) -> "WorkflowRuntime":
+        """Return the runtime for one child invocation of this run."""
+        if self.child_factory is None:
+            return self
+        return self.child_factory(scope)

@@ -24,6 +24,7 @@ import urllib.error
 import urllib.request
 import uuid
 from copy import copy
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -830,10 +831,33 @@ class Kernel:
             return answer
         return None
 
+    def _runtime_for_role(self, role: RoleConfig) -> WorkflowRuntime | None:
+        """Narrow the run's Python tools to the role's declared grant.
+
+        ``runtime.tools`` is already the run-level grant supplied by the
+        application. A role that declares ``tools`` sees exactly those names;
+        an undeclared name is a configuration error, never unrestricted
+        discovery. A role with no declaration keeps the run grant for
+        backward compatibility with existing Python roles.
+        """
+        if self.runtime is None:
+            return None
+        tools = self.runtime.tools
+        if role.tools:
+            missing = sorted(set(role.tools) - set(tools))
+            if missing:
+                raise ManifestError(
+                    f"role '{role.name}' requests tool(s) not granted by its "
+                    f"run: {', '.join(missing)}"
+                )
+            tools = {name: tools[name] for name in role.tools}
+        return replace(self.runtime, tools=tools)
+
     def _execute_role(self, phase: PhaseConfig) -> dict[str, Any]:
         role = self.manifest.roles[phase.role or ""]
         if self.runtime is not None and role.mcp and self.allowed_mcp is None:
             raise ManifestError("Runtime roles require explicit MCP grants before requesting services.")
+        role_runtime = self._runtime_for_role(role)
         attempt = self.journal.attempts_for_phase(phase.name, item=self._item_scope(phase.name)) + 1
         if self.allowed_mcp is not None:
             denied = sorted(set(role.mcp) - self.allowed_mcp)
@@ -881,8 +905,8 @@ class Kernel:
             / f"{phase.name}{item_tag}_attempt{attempt}_{driver_kind}.json"
         )
         session_options: dict[str, Any] = {}
-        if driver_kind == "pm-coder" and self.runtime is not None:
-            session_options["runtime"] = self.runtime
+        if driver_kind == "pm-coder" and role_runtime is not None:
+            session_options["runtime"] = role_runtime
         if isinstance(driver, PythonDriver):
             session_options["context"] = RoleContext(
                 run_id=role_run_id,
@@ -892,7 +916,7 @@ class Kernel:
                 prompt=prompt, task_text=self.task_text,
                 current_item=self.current_item, feedback=feedback, answer=answer,
                 tools=list(role.tools), result_file=result_file, trace_file=trace_file,
-                runtime=self.runtime,
+                runtime=role_runtime,
             )
         if self.allowed_mcp is not None:
             if not getattr(driver, "supports_explicit_mcp_config", False):
@@ -1005,24 +1029,41 @@ class Kernel:
     def _filtered_mcp_config(
         self, phase: PhaseConfig, role: RoleConfig, attempt: int
     ) -> Path:
-        source = self.workspace / ".mcp.json"
-        servers: dict[str, Any] = {}
-        if source.is_file():
-            payload = json.loads(source.read_text(encoding="utf-8"))
-            raw_servers = payload.get("mcpServers")
-            if not isinstance(raw_servers, dict):
-                raise ManifestError(f"MCP config must contain mcpServers: {source}")
+        """Write a per-attempt MCP config from the run's scoped services.
+
+        A runtime that supplies ``mcp_servers`` is authoritative: the config
+        is built from those descriptors, private to this attempt, and never
+        from a shared workspace file. Without one, the legacy
+        ``workspace/.mcp.json`` discovery path still applies.
+        """
+        if self.runtime is not None and self.runtime.mcp_servers is not None:
+            raw_servers = self.runtime.mcp_servers
             missing = sorted(set(role.mcp) - set(raw_servers))
             if missing:
                 raise ManifestError(
-                    f"role '{role.name}' requires MCP server(s) absent from {source}: "
-                    + ", ".join(missing)
+                    f"role '{role.name}' requires MCP service(s) not granted by "
+                    f"its run: " + ", ".join(missing)
                 )
             servers = {name: raw_servers[name] for name in role.mcp}
-        elif role.mcp:
-            raise ManifestError(
-                f"role '{role.name}' requires MCP server(s) but {source} does not exist"
-            )
+        else:
+            source = self.workspace / ".mcp.json"
+            servers = {}
+            if source.is_file():
+                payload = json.loads(source.read_text(encoding="utf-8"))
+                raw_servers = payload.get("mcpServers")
+                if not isinstance(raw_servers, dict):
+                    raise ManifestError(f"MCP config must contain mcpServers: {source}")
+                missing = sorted(set(role.mcp) - set(raw_servers))
+                if missing:
+                    raise ManifestError(
+                        f"role '{role.name}' requires MCP server(s) absent from {source}: "
+                        + ", ".join(missing)
+                    )
+                servers = {name: raw_servers[name] for name in role.mcp}
+            elif role.mcp:
+                raise ManifestError(
+                    f"role '{role.name}' requires MCP server(s) but {source} does not exist"
+                )
         if self.require_http_mcp:
             for name, server in servers.items():
                 if not isinstance(server, dict) or not isinstance(server.get("url"), str):
@@ -1807,6 +1848,7 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
         ):
             child_driver = copy(self.driver)
             child_driver.max_turns = phase.limits.max_agent_requests
+        child_runtime = self.runtime.child(invocation) if self.runtime is not None else None
         child = Kernel(
             manifest_path=manifest,
             workspace=self.workspace,
@@ -1834,7 +1876,7 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
             resource_resolver=self.resource_resolver,
             external_answer_root=self.external_answer_root,
             human_resolution=self.human_resolution,
-            runtime=self.runtime,
+            runtime=child_runtime,
         )
         summary = child.run()
         raw_status: Any = summary.get("terminal_status")

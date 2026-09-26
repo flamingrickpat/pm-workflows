@@ -23,6 +23,20 @@ Roles that request MCP services require explicit grants. Dynamic service binding
 The driver checks the cancellation event during inference and waits for asynchronous session cleanup.
 Synchronous tool effects remain cooperative. Cancellation cannot undo a completed effect.
 Runtime exceptions reach the caller. Standalone driver calls retain their previous error normalization.
+A permanent endpoint rejection (authentication, billing, or model configuration) now raises
+`PermanentProviderError` in pm-coder 0.9.2; the driver reports it as provider exhaustion instead of retrying.
+
+## Runtime scopes and grants
+
+`WorkflowRuntime.tools` is the run-level Python grant supplied by the embedder. A role that declares
+`tools` sees exactly those names; an undeclared name is a `ManifestError`. A role with no declaration
+keeps the run grant.
+`WorkflowRuntime.mcp_servers` supplies named scoped service descriptors for the run. When present it
+replaces shared `.mcp.json` discovery, and each attempt receives its own private config under the
+kernel data root. A requested service absent from the run grant is a `ManifestError`.
+`WorkflowRuntime.child_factory(scope)` opens the runtime for one child workflow invocation. Without one
+the child reuses the parent runtime, preserving existing embedders. Child cancellation inherits the
+parent stop event, and child capability intersection (`allowed_mcp`/`allowed_effects`) is unchanged.
 
 Run `tests/test_agent_runtime_live.py` to check both targets and cancellation with a real Qwen endpoint.
 

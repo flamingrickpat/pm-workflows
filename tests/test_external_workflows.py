@@ -202,8 +202,14 @@ def test_completed_child_invocation_is_reused_after_parent_crash_window(
     )
     phase = kernel.manifest.phases[0]
 
-    first = kernel._run_child(phase, attempt=1, index=1, item=None, depth_remaining=1)
-    second = kernel._run_child(phase, attempt=1, index=1, item=None, depth_remaining=1)
+    first = kernel._run_child(
+        phase, attempt=1, index=1, item=None, depth_remaining=1,
+        attempt_scope=None, sequence=1,
+    )
+    second = kernel._run_child(
+        phase, attempt=1, index=1, item=None, depth_remaining=1,
+        attempt_scope=None, sequence=1,
+    )
 
     assert first["status"] == "completed"
     assert second["status"] == "completed"

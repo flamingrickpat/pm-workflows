@@ -10,6 +10,19 @@ from typing import Any
 
 from pm_coder import run_auto, async_run_auto, async_run_auto_with_bash_machine
 
+try:  # pm-coder 0.9.2+ distinguishes faults a retry cannot fix.
+    from pm_coder import PermanentProviderError
+    from pm_coder import is_permanent_failure
+    _HAS_PERMANENT = True
+except ImportError:  # pragma: no cover - older installed coder
+    class PermanentProviderError(RuntimeError):
+        pass
+
+    def is_permanent_failure(exc: BaseException) -> bool:
+        return False
+
+    _HAS_PERMANENT = False
+
 from ..protocol import AgentResult
 from ..runtime import WorkflowRuntime, WorkflowTerminated
 from .common import deployed_mcp_config, extract_json, trace_write
@@ -167,13 +180,18 @@ class PmCoderDriver:
 _PROVIDER_EXHAUSTION_MARKERS = (
     "endpoint did not recover",
     "endpoint unavailable",
-    "wall-clock limit",
+    "endpoint not answering",
 )
 
 
 def _is_provider_exhaustion(exc: BaseException) -> bool:
     """True when the failure is the model endpoint, not the model output."""
-    # pm-coder does not export a specific exhaustion error type.
+    # pm-coder raises a typed permanent rejection (auth, billing, config) that
+    # no retry can clear; older versions expose no such type.
+    if isinstance(exc, PermanentProviderError):
+        return True
+    if is_permanent_failure(exc):
+        return True
     if isinstance(exc, (ConnectionError, OSError, TimeoutError)):
         return True
     message = str(exc).casefold()
