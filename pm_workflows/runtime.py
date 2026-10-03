@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, ContextManager, Mapping
 
 from .working_target import WorkingEnvironment
 
@@ -52,6 +52,10 @@ class WorkflowRuntime:
     # Classification connections are explicit and independent of the agent.
     # An absent name produces INVALID. Existing roles need no new connection.
     classification_models: Mapping[str, AgentModel] = field(default_factory=dict)
+    # The application can activate a connection only at a classification call.
+    # The session holds service ownership until direct inference or recovery ends.
+    # Arguments are the connection name, recovery flag, and cancellation signal.
+    classification_session: Callable[[str, bool, threading.Event], ContextManager[AgentModel]] | None = None
 
     def check_cancelled(self) -> None:
         if self.stop_event.is_set():
@@ -61,4 +65,8 @@ class WorkflowRuntime:
         """Return the runtime for one child invocation of this run."""
         if self.child_factory is None:
             return self
-        return self.child_factory(scope)
+        child = self.child_factory(scope)
+        if child.classification_session is None and self.classification_session is not None:
+            from dataclasses import replace
+            child = replace(child, classification_session=self.classification_session)
+        return child

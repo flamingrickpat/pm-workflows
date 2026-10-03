@@ -264,3 +264,14 @@ hooks are not implemented. `context.include` and `context.exclude` are recorded
 and placed in the child request, but they are not a filesystem ACL.
 `allow_effects` is recorded in receipts but cannot be enforced until effect
 adapters expose typed capability IDs.
+# Application classification sessions
+
+`WorkflowRuntime.classification_session` can supply a lazy model session.
+The callback receives the connection name, recovery flag, and cancellation event.
+It returns a context manager that yields an `AgentModel`.
+The context spans direct inference or the complete isolated recovery session.
+Explicit `classification_models` and `agent_model` values keep their existing path.
+Child runtimes inherit the callback unless their factory supplies another one.
+An application session can select pm-coder for classification recovery while ordinary roles retain their driver.
+The callback must raise `InputError` for a routed configuration or service error.
+It must raise `WorkflowTerminated` for cancellation and release service ownership on every exit.
