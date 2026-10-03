@@ -119,7 +119,7 @@ def test_receipt_replay_rejects_changed_value_contract_and_answer(tmp_path):
                "captures": {"exact": capture.evidence}, "answer": answer}
     receipt["contract_sha256"] = digest({"instruction": receipt["instruction"], "classes": classes})
     assert replay_classification(receipt) == answer
-    for mutation in ("value", "classes", "quote", "digest", "label", "field"):
+    for mutation in ("value", "classes", "quote", "digest", "label", "field", "empty_candidate", "internal_candidate"):
         altered = deepcopy(receipt)
         if mutation == "value": altered["captures"]["exact"]["value"] += "FAILED"
         if mutation == "classes": altered["classes"]["passed"] = "No tests passed."
@@ -127,6 +127,8 @@ def test_receipt_replay_rejects_changed_value_contract_and_answer(tmp_path):
         if mutation == "digest": altered["answer"]["input_sha256"] = "old"
         if mutation == "label": altered["answer"]["status"] = "unknown"
         if mutation == "field": del altered["answer"]["status"]
+        if mutation == "empty_candidate": altered["answer"]["candidate_id"] = ""
+        if mutation == "internal_candidate": altered["answer"]["candidate_id"] = "exact"
         with pytest.raises(InputError): replay_classification(altered)
 
 

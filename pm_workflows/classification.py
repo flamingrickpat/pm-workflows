@@ -65,9 +65,10 @@ def validate_answer(answer: Any, classes: dict[str, str], captures: dict[str, In
             raise InputError("invalid_response", "INVALID must use null evidence identifiers")
         return deepcopy(answer)
     key = answer["candidate_id"]
-    if key is not None and not isinstance(key, str):
-        raise InputError("unknown_candidate", "candidate_id must be text or null")
-    capture = captures.get(key or "exact")
+    # The internal exact-capture key is not a listed candidate identifier.
+    if key is not None and (not isinstance(key, str) or key in {"", "exact"}):
+        raise InputError("unknown_candidate", "candidate_id must be a listed ID or null")
+    capture = captures.get("exact" if key is None else key)
     if capture is None:
         raise InputError("unknown_candidate", str(key))
     if answer["input_sha256"] != capture.evidence["value_sha256"]:
