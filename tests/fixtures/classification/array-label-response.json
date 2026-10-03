@@ -1,0 +1,38 @@
+{
+  "choices": [
+    {
+      "finish_reason": "stop",
+      "index": 0,
+      "message": {
+        "role": "assistant",
+        "content": "{\n  \"candidate_id\": \"18a26dd741f06928f369958ad818fc1b62418f80f530f5c35edde4111c0dd083\",\n  \"evidence\": [\n    \"Ran 261 tests in 493.985s\",\n    \"OK\"\n  ],\n  \"input_sha256\": \"7ab9e6d25f7c501b81ecfe60788c812abfbb8e0b7ae3f79083e55444bbc38fd2\",\n  \"reason\": \"The test run summary indicates 261 tests were run and the final status is 'OK', which signifies all tests passed.\",\n  \"status\": [\n    \"all_good\"\n  ]\n}"
+      }
+    }
+  ],
+  "created": 1791061111,
+  "model": "qwen",
+  "system_fingerprint": "b11351-631109b34",
+  "object": "chat.completion",
+  "usage": {
+    "completion_tokens": 219,
+    "prompt_tokens": 409,
+    "total_tokens": 628,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "id": "chatcmpl-5fB80ObE2a847eFK5XIhbIzkp57WWw8e",
+  "timings": {
+    "cache_n": 0,
+    "prompt_n": 409,
+    "prompt_ms": 284.621,
+    "prompt_per_token_ms": 0.6958948655256724,
+    "prompt_per_second": 1436.998675431539,
+    "predicted_n": 219,
+    "predicted_ms": 1472.656,
+    "predicted_per_token_ms": 6.755302752293578,
+    "predicted_per_second": 148.03185536880304,
+    "draft_n": 306,
+    "draft_n_accepted": 174
+  }
+}

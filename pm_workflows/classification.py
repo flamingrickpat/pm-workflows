@@ -31,10 +31,16 @@ ANSWER_FIELDS = {"status", "reason", "evidence", "candidate_id", "input_sha256"}
 
 def answer_contract(classes: dict[str, str]) -> dict[str, Any]:
     """Return the shared direct and agent answer schema, including INVALID."""
-    return {"status": list(classes) + [INVALID], "reason": "nonempty string",
-            "evidence": "array of exact nonempty source quotes",
-            "candidate_id": "listed ID for folder input, otherwise null",
-            "input_sha256": "captured value_sha256 for a class, otherwise null"}
+    return {"type": "object", "additionalProperties": False, "required": sorted(ANSWER_FIELDS),
+            "properties": {
+                "status": {"type": "string", "enum": list(classes) + [INVALID]},
+                "reason": {"type": "string", "minLength": 1},
+                "evidence": {"type": "array", "items": {"type": "string", "minLength": 1},
+                             "description": "Exact source quotes; at least one for a class."},
+                "candidate_id": {"type": ["string", "null"],
+                                 "description": "Listed ID for folder input, otherwise null. INVALID uses null."},
+                "input_sha256": {"type": ["string", "null"],
+                                 "description": "Captured value_sha256 for a class. INVALID uses null."}}}
 
 
 def validate_answer(answer: Any, classes: dict[str, str], captures: dict[str, InputCapture]) -> dict[str, Any]:
@@ -163,6 +169,7 @@ def _inference(kernel, config, stage, data, receipt):
                         "Do not impose an unstated minimum file size. A short log can contain complete test results. ")
         instruction += ('Return exactly {"candidate_id": "a listed ID or INVALID", "reason": "concrete reason"}.')
     else:
+        instruction += "status must be one string label, never an array of labels. "
         instruction += "For INVALID, use null candidate_id, null input_sha256, and an empty evidence array. "
         instruction += "Use this answer contract: " + canonical(answer_contract(config.classes))
     return asyncio.run(_complete(model, config, [{"role": "system", "content": instruction},
@@ -336,6 +343,7 @@ def _fallback(kernel, phase, receipt, captures):
               "Copy input_sha256 exactly from the selected descriptor. "
               "It hashes the canonical captured value and can differ from the raw file hash. "
               "Copy candidate_id exactly from that descriptor, including null for an exact input. "
+              "status must be one string label, never an array of labels. "
               "Return exactly one JSON object with every field in answer_contract.\n" + canonical({
                   "instruction": config.instruction, "classes": config.classes,
                   "answer_contract": answer_contract(config.classes), "invalid_reason": origin["result"]["reason"],

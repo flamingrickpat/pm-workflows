@@ -8,3 +8,9 @@ Source receipt:
 `C:/source/pm/pm_next_v2/.runtime/alpha/a04/live-full-development/incomplete-primary.json`.
 The original receipt retains the complete request, response, captured log, and model identity.
 This fixture checks envelope parsing. It does not replace live inference acceptance.
+
+`array-label-response.json` preserves the actual failed host classification from
+`C:/source/pm/pm_next_v2/.runtime/alpha/a04/live-delivery/host-primary.json`.
+The model returned an array for `status`. The validator rejected it with `unknown_label`.
+The shared prompt now uses typed JSON Schema and requires one string label.
+The fixture checks rejection without normalizing or accepting the malformed answer.

@@ -7,7 +7,7 @@ import threading
 import pytest
 import yaml
 
-from pm_workflows.classification import ClassificationEnvironment, parse_completion, replay_classification
+from pm_workflows.classification import ClassificationEnvironment, parse_completion, replay_classification, validate_answer
 from pm_workflows.dryrun import build_graph, check_workflow
 from pm_workflows.inputs import InputError, InputResolver, InputScope, digest
 from pm_workflows.kernel import Kernel
@@ -15,6 +15,14 @@ from pm_workflows.manifest import ManifestError, parse_workflow
 from pm_workflows.runtime import WorkflowRuntime
 from pm_workflows.working_target import HostInputEnvironment
 from pathlib import Path
+
+
+def test_captured_array_label_is_rejected():
+    response = json.loads((Path(__file__).parent / "fixtures/classification/array-label-response.json").read_text(encoding="utf-8"))
+    answer = parse_completion(response)
+    assert answer["status"] == ["all_good"]
+    with pytest.raises(InputError, match="unknown_label"):
+        validate_answer(answer, {"all_good": "All tests passed."}, {})
 
 
 def manifest(tmp_path, **changes):
