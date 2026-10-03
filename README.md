@@ -1,5 +1,7 @@
 # pm-workflows
 
+See [scoped input bindings](docs/input-bindings.md) for file versions, folder metadata, request fields, and named outputs.
+
 Version 0.5.1 pins pm-coder 0.10.0 with its optional `pm_decision` Python client.
 Workflow execution keeps its existing LLM driver.
 No classification phase or automatic Laya route is active in this release.

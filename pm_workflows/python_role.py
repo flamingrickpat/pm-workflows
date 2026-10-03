@@ -64,3 +64,5 @@ class RoleContext:
     result_file: Path | None = None
     trace_file: Path | None = None
     runtime: WorkflowRuntime | None = None
+    inputs: dict[str, Any] = field(default_factory=dict)
+    input_evidence: dict[str, Any] = field(default_factory=dict)

@@ -23,8 +23,8 @@ import time
 import urllib.error
 import urllib.request
 import uuid
-from copy import copy
-from dataclasses import replace
+from copy import copy, deepcopy
+from dataclasses import asdict, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -44,6 +44,7 @@ from .drivers.python_driver import PythonDriver
 from .extensions import EMPTY_PHASE_EXTENSIONS, PhaseExtensionRegistry
 from .gates import run_gate
 from .journal import Journal
+from .inputs import GrantedInputEnvironment, InputError, InputResolver, InputScope, digest
 from .manifest import ManifestError, Workflow, parse_workflow
 from .protocol import (
     ROUTE_EXIT_LOOP,
@@ -60,6 +61,7 @@ from .protocol import (
 from .python_role import RoleContext
 from .ratelimit import TokenLimitError
 from .runtime import WorkflowRuntime, WorkflowTerminated
+from .working_target import HostInputEnvironment
 
 WORK_ITEM_GLOB = "WI-*.md"
 
@@ -99,6 +101,8 @@ class Kernel:
         external_answer_root: Path | None = None,
         human_resolution: str | None = None,
         runtime: WorkflowRuntime | None = None,
+        request_data: Any = None,
+        invocation_item: str | None = None,
     ) -> None:
         self.manifest_path = Path(manifest_path)
         self.workspace = Path(workspace).resolve()
@@ -130,6 +134,9 @@ class Kernel:
         # standalone execution keeps its declared behavior.
         self.human_resolution = human_resolution
         self.runtime = runtime
+        self.request_data = deepcopy(request_data)
+        self.invocation_item = invocation_item
+        self._active_child_inputs: list[dict[str, Any]] = []
 
         self._variables = {
             "TASK_ID": task_id,
@@ -869,6 +876,7 @@ class Kernel:
                 self.journal.append(JournalEntry(
                     run_id=self.run_id, phase=phase.name, kind="role", role=role.name,
                     attempt=attempt, ok=False, verdict="capability_denied", errors=errors,
+                    named_outputs={name: None for name in phase.outputs},
                 ))
                 return {"valid": False, "status": None, "errors": errors, "data": {}}
         skill_path = self._resolve_resource("skill", role.skill)
@@ -884,6 +892,17 @@ class Kernel:
 
         self._settle_worktree(phase)
 
+        try:
+            input_values, input_evidence = self.capture_inputs(phase)
+        except InputError as exc:
+            self.journal.append(JournalEntry(
+                run_id=self.run_id, phase=phase.name, kind="role", role=role.name,
+                attempt=attempt, ok=False, verdict="invalid_input", item=self.current_item,
+                errors=[str(exc)], named_outputs={name: None for name in phase.outputs},
+                input_evidence=exc.evidence,
+            ))
+            return {"valid": False, "status": None, "errors": [str(exc)], "data": {}}
+
         print(f"\n>>> {phase.name}  role={role.name}  attempt {attempt}")
         if self.current_item:
             print(f"    work item: {self.current_item}")
@@ -891,6 +910,8 @@ class Kernel:
             print(f"    feedback: {feedback.splitlines()[0][:140]}")
 
         prompt = self._build_prompt(role, phase, attempt, feedback, answer, skill_path)
+        if input_evidence:
+            prompt += "\n\n## Captured workflow inputs\n" + json.dumps(input_evidence, ensure_ascii=False, indent=2)
         base_rev = self.checkpoint.current_rev() if self.checkpoint else None
         driver = self._driver_for_skill(skill_path)
         driver_kind = getattr(driver, "kind", "agent")
@@ -917,6 +938,7 @@ class Kernel:
                 current_item=self.current_item, feedback=feedback, answer=answer,
                 tools=list(role.tools), result_file=result_file, trace_file=trace_file,
                 runtime=role_runtime,
+                inputs=input_values, input_evidence=deepcopy(input_evidence),
             )
         if self.allowed_mcp is not None:
             if not getattr(driver, "supports_explicit_mcp_config", False):
@@ -927,6 +949,7 @@ class Kernel:
                     run_id=self.run_id, phase=phase.name, kind="role", role=role.name,
                     attempt=attempt, ok=False, verdict="capability_unenforceable",
                     errors=errors,
+                    named_outputs={name: None for name in phase.outputs},
                 ))
                 return {"valid": False, "status": None, "errors": errors, "data": {}}
             session_options["mcp_config"] = self._filtered_mcp_config(
@@ -953,6 +976,7 @@ class Kernel:
                     run_id=self.run_id, phase=phase.name, kind="rate_limit",
                     role=role.name, attempt=attempt, ok=False,
                     verdict="usage_limit", errors=[str(limit)[-500:]],
+                    named_outputs={name: None for name in phase.outputs},
                 ))
                 raise
 
@@ -979,6 +1003,19 @@ class Kernel:
         status, errors = self._read_contract(role, agent)
         candidate_rev = self.checkpoint.current_rev() if self.checkpoint else None
         valid = status is not None
+        named_outputs = {name: None for name in phase.outputs}
+        if valid and phase.outputs and (not agent.ok or errors):
+            status, valid = None, False
+            errors.append("named outputs require a successful producer execution")
+        if valid and phase.outputs:
+            try:
+                named_outputs = self._input_resolver().project_outputs(
+                    phase.outputs, agent.result_json, phase=phase.name,
+                    attempt=attempt, revision=candidate_rev,
+                )
+            except InputError as exc:
+                status, valid = None, False
+                errors.append(str(exc))
         archived_artifacts = self._write_attempt_receipt(
             phase, attempt, status, errors, agent.result_json, agent.trace_path,
             base_rev, candidate_rev,
@@ -992,6 +1029,7 @@ class Kernel:
             result=agent.result_json, trace_path=agent.trace_path,
             artifacts=archived_artifacts,
             session_ref=agent.session_ref or None,
+            input_evidence=input_evidence, named_outputs=named_outputs,
         ))
 
         print(f"    -> status={status or 'CONTRACT VIOLATION'}")
@@ -1653,6 +1691,7 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
             self.journal.append(JournalEntry(
                 run_id=self.run_id, phase=phase.name, kind="workflow",
                 attempt=attempt, ok=False, verdict="max_attempts", errors=errors,
+                named_outputs={name: None for name in phase.outputs},
             ))
             return {"valid": False, "status": None, "errors": errors, "data": {}}
 
@@ -1671,6 +1710,7 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
                 attempt=attempt, ok=status is not None,
                 verdict=status or "depth_exhausted", status=status, errors=errors,
                 result={"depth_remaining": self.depth_remaining, "decrement": decrement},
+                named_outputs={name: None for name in phase.outputs},
             ))
             return {
                 "valid": status is not None, "status": status, "errors": errors,
@@ -1709,6 +1749,16 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
             "sequence": sequence,
             "attempt_scope": attempt_scope,
         }
+        named_outputs = {name: None for name in phase.outputs}
+        if valid and phase.outputs:
+            try:
+                named_outputs = self._input_resolver().project_outputs(
+                    phase.outputs, result, phase=phase.name, attempt=attempt,
+                    revision=self.accepted_revision,
+                )
+            except InputError as exc:
+                status, valid = None, False
+                errors.append(str(exc))
         artifacts = [
             artifact for receipt in receipts for artifact in receipt.get("artifacts", [])
         ]
@@ -1716,6 +1766,7 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
             run_id=self.run_id, phase=phase.name, kind="workflow", attempt=attempt,
             ok=valid, verdict=status or "invalid_child_result", status=status,
             errors=errors, result=result, artifacts=artifacts, item=attempt_scope,
+            named_outputs=named_outputs,
         ))
         receipt_dir = self.kernel_data / "child-receipts" / phase.name
         receipt_dir.mkdir(parents=True, exist_ok=True)
@@ -1749,10 +1800,72 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
                     out["data"]["repair_reports"] = repair_reports
         return out
 
+    def _input_resolver(self, *, item: str | None = None) -> InputResolver:
+        """Use the runtime view. Host reads apply only to legacy host invocations."""
+        environment = self.runtime.environment if self.runtime is not None else HostInputEnvironment(self.workspace)
+        entries = self.journal.read_all()
+        child_inputs = [child for entry in entries if entry.get("kind") == "workflow"
+                        for child in (entry.get("result") or {}).get("children", []) if isinstance(child, dict)]
+        return InputResolver(environment, InputScope(self.task_id, self.run_id, item if item is not None else self.current_item or self.invocation_item),
+                             request=self.request_data, entries=entries + child_inputs + self._active_child_inputs)
+
+    def capture_inputs(self, phase: PhaseConfig, variables: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Capture a phase's explicit bindings for a role or phase extension.
+
+        The returned receipts include full values, digests, and producer identity.
+        InputError leaves dispatch to the caller's declared invalid route.
+        Cancellation propagates before or after each capture without a retry.
+        """
+        resolver = self._input_resolver()
+        if phase.foreach is not None and variables:
+            stable_field = phase.foreach.stable_id.removeprefix(phase.foreach.item + ".")
+            item_id = str(dotted(variables[phase.foreach.item], stable_field))
+            resolver.scope = replace(resolver.scope, item=f"{resolver.scope.item or ''}/{phase.name}/{item_id}")
+        if phase.kind == "role":
+            role = self.manifest.roles[phase.role or ""]
+            resolver.environment = GrantedInputEnvironment(resolver.environment, role.readable_paths, role.deny_access)
+        values: dict[str, Any] = {}
+        evidence: dict[str, Any] = {}
+        runtime_variables = {"request": self.request_data, **(variables or {})}
+        for name, binding in phase.inputs.items():
+            if self.runtime is not None:
+                self.runtime.check_cancelled()
+            source = binding.source
+            folder = binding.input_folder
+            dependencies: dict[str, Any] = {}
+            if binding.mode in {"input_file", "input_folder"}:
+                # Resolve only referenced outputs. An unrelated stale output
+                # cannot block a request-field path.
+                output_names = re.findall(r"\$\{outputs\.([A-Za-z_][A-Za-z0-9_]*)", source + (folder or ""))
+                for key in output_names:
+                    dependency = resolver.named_output(key)
+                    dependencies[key] = dependency.evidence
+                runtime_variables["outputs"] = {key: record["value"] for key, record in dependencies.items()}
+                try:
+                    source = expand_runtime(source, runtime_variables)
+                    folder = expand_runtime(folder, runtime_variables)
+                except (ManifestError, IndexError) as exc:
+                    raise InputError("missing_field", str(exc)) from exc
+                if not isinstance(source, str) or "${" in source or (folder is not None and (not isinstance(folder, str) or "${" in folder)):
+                    raise InputError("malformed_value", "file paths contain unresolved or non-text variables")
+            try:
+                capture = resolver.resolve(replace(binding, source=source, input_folder=folder))
+            except InputError as exc:
+                exc.evidence = {**evidence, name: {"error": str(exc), "code": exc.code, **exc.evidence}}
+                raise
+            values[name], evidence[name] = capture.value, capture.evidence
+            evidence[name]["binding"] = asdict(binding)
+            evidence[name]["binding_sha256"] = digest(asdict(binding))
+            evidence[name]["path_dependencies"] = dependencies
+            if self.runtime is not None:
+                self.runtime.check_cancelled()
+        return values, evidence
+
     def _child_items(self, phase: PhaseConfig) -> list[Any | None]:
         if phase.foreach is None:
             return [None]
-        raw = load_reference(phase.foreach.source, self.workspace)
+        raw = load_reference(phase.foreach.source, self.workspace,
+                             self.runtime.environment if self.runtime is not None else None)
         if not isinstance(raw, list):
             raise ManifestError(
                 f"foreach source for '{phase.name}' must resolve to a list"
@@ -1822,8 +1935,13 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
                 cached = None
             if isinstance(cached, dict):
                 cached["reused"] = True
+                self._active_child_inputs.append(cached)
                 return cached
         inputs = self._resolve_child_value(task.input, variables)
+        bound_inputs, input_evidence = self.capture_inputs(phase, variables)
+        if set(inputs) & set(bound_inputs):
+            raise InputError("malformed_value", "child task.input duplicates a phase input binding")
+        inputs = {**inputs, **bound_inputs}
         task_text = json.dumps(
             {
                 "parent_task_id": self.task_id,
@@ -1877,11 +1995,14 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
             external_answer_root=self.external_answer_root,
             human_resolution=self.human_resolution,
             runtime=child_runtime,
+            request_data=inputs,
+            invocation_item=(f"{outer_item or self.invocation_item or ''}/{phase.name}/{stable_id}" if phase.foreach else outer_item or self.invocation_item),
         )
         summary = child.run()
         raw_status: Any = summary.get("terminal_status")
         if result_contract.status_from:
-            raw_status = load_reference(result_contract.status_from, child.task_dir)
+            raw_status = load_reference(result_contract.status_from, child.task_dir,
+                                        child_runtime.environment if child_runtime is not None else None)
         if raw_status is None:
             raw_status = result_contract.default_status or None
         status = result_contract.status_map.get(str(raw_status), str(raw_status)) \
@@ -1923,6 +2044,7 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
                 "mcp": sorted(allowed_mcp) if allowed_mcp is not None else None,
                 "effects": sorted(allowed_effects) if allowed_effects is not None else None,
             },
+            "input_evidence": input_evidence,
         }
         child_root.mkdir(parents=True, exist_ok=True)
         temporary = child_root / "receipt.json.tmp"
@@ -1931,6 +2053,7 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
             encoding="utf-8",
         )
         temporary.replace(durable_receipt)
+        self._active_child_inputs.append(receipt)
         return receipt
 
     def _workflow_attempt_scope(self, phase: PhaseConfig) -> str | None:
@@ -1961,7 +2084,8 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
         if "from" in expanded:
             reference = str(expanded["from"])
             try:
-                return load_reference(reference, self.workspace)
+                return load_reference(reference, self.workspace,
+                                      self.runtime.environment if self.runtime is not None else None)
             except ManifestError:
                 if expanded.get("required", True):
                     raise
@@ -1970,6 +2094,8 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
             source = str(expanded["from_child"])
             for entry in reversed(self.journal.read_all()):
                 if entry.get("kind") == "workflow" and entry.get("phase") == source:
+                    if not entry.get("ok") or entry.get("item") != self._workflow_attempt_scope(self.manifest.phase_by_name(source)):
+                        raise InputError("stale_output", f"child result '{source}' is invalid or belongs to a previous item")
                     return entry.get("result")
             raise ManifestError(f"no completed child result exists for phase '{source}'")
         return {

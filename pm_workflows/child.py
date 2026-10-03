@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 import yaml
@@ -60,7 +60,8 @@ def expand_runtime(value: Any, variables: dict[str, Any]) -> Any:
     return VARIABLE.sub(replace, value)
 
 
-def _structured_text(path: Path, text: str) -> Any:
+def _structured_text(path: str | Path, text: str) -> Any:
+    path = PurePosixPath(str(path))
     if path.suffix.lower() == ".json":
         return json.loads(text)
     if path.suffix.lower() in {".yaml", ".yml"}:
@@ -91,29 +92,45 @@ def _json_pointer(value: Any, pointer: str, reference: str) -> Any:
     return current
 
 
-def load_reference(reference: str, workspace: Path) -> Any:
-    """Load a file/glob and optional RFC-6901-style ``#/`` pointer."""
+def load_reference(reference: str, workspace: Path, environment: Any = None) -> Any:
+    """Read a scoped file or glob and an optional JSON pointer.
+
+    Supplied environments own all paths. Legacy host references remain scoped
+    to workspace, including absolute references inside that workspace.
+    """
+    from .inputs import InputResolver, InputScope, relative_path, select_pointer
+    from .working_target import HostInputEnvironment
     source, marker, pointer = reference.partition("#/")
-    candidate = Path(source)
-    if not candidate.is_absolute():
-        candidate = workspace / candidate
+    if environment is None:
+        candidate = Path(source)
+        if candidate.is_absolute():
+            try:
+                source = candidate.resolve().relative_to(workspace.resolve()).as_posix()
+            except ValueError as exc:
+                raise ManifestError(f"reference escapes the workspace: {reference}") from exc
+        environment = HostInputEnvironment(workspace)
+    resolver = InputResolver(environment, InputScope("reference", "reference"))
     if any(token in source for token in ("*", "?", "[")):
         if marker:
             raise ManifestError(f"glob reference cannot use a JSON pointer: {reference}")
-        try:
-            pattern = candidate.relative_to(workspace).as_posix()
-        except ValueError as exc:
-            raise ManifestError(f"glob reference must be inside the workspace: {reference}") from exc
-        return [
-            {"path": path.relative_to(workspace).as_posix(), "content": path.read_text(encoding="utf-8")}
-            for path in sorted(workspace.glob(pattern)) if path.is_file()
-        ]
-    if not candidate.is_file():
-        raise ManifestError(f"input artifact does not exist: {candidate}")
-    text = candidate.read_text(encoding="utf-8")
+        import fnmatch
+        source = relative_path(source)
+        if isinstance(environment, HostInputEnvironment):
+            return [{"path": path.relative_to(workspace.resolve()).as_posix(),
+                     "content": resolver.capture_file(path.relative_to(workspace.resolve()).as_posix()).value}
+                    for path in sorted(workspace.resolve().glob(relative_path(source))) if path.is_file()]
+        # Virtual folder components stay exact. The environment exposes only
+        # direct-child file listings, with no recursive directory contract.
+        components = source.split("/")
+        if any(any(token in part for token in ("*", "?", "[")) for part in components[:-1]):
+            raise ManifestError("glob folder components must be exact scoped paths")
+        folder = "/".join(components[:-1]) or "."
+        return [{"path": path, "content": resolver.capture_file(path).value}
+                for path in environment.list_files(folder) if fnmatch.fnmatchcase(path, source)]
+    text = resolver.capture_file(source).value
     if not marker:
         return text
-    return _json_pointer(_structured_text(candidate, text), pointer, reference)
+    return select_pointer(_structured_text(source, text), "/" + pointer)
 
 
 def order_items(items: list[Any], stable_id: str, order: str) -> list[Any]:

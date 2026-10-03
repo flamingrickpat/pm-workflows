@@ -23,6 +23,8 @@ from .protocol import (
     ChildTaskConfig,
     ChildWorkspaceConfig,
     ForeachConfig,
+    InputBinding,
+    OutputBinding,
     RESERVED_ROUTES,
     ROUTE_EXIT_LOOP,
     ROUTE_NEXT_ITEM,
@@ -397,8 +399,70 @@ def _parse_phase(
         workflow=raw.get("workflow"),
         allowed_roles=raw.get("allowed_roles", []) or [],
         extension=extension_data,
+        inputs=_parse_inputs(raw.get("inputs"), path, name),
+        outputs=_parse_outputs(raw.get("outputs"), path, name),
         **child_fields,
     )
+
+
+def _binding_options(raw: dict[str, Any], path: Path, label: str) -> dict[str, Any]:
+    from .inputs import JSON_TYPES
+    pointer = raw.get("pointer", "")
+    if not isinstance(pointer, str) or (pointer and not pointer.startswith("/")):
+        raise ManifestError(f"{path}: {label}.pointer must be empty or start with '/'")
+    if re.search(r"~(?![01])", pointer):
+        raise ManifestError(f"{path}: {label}.pointer has an invalid escape")
+    expected = raw.get("expected_type")
+    if expected is not None and (not isinstance(expected, str) or expected not in JSON_TYPES):
+        raise ManifestError(f"{path}: {label}.expected_type must be a JSON type")
+    return {"pointer": pointer, "expected_type": expected}
+
+
+def _parse_inputs(raw: Any, path: Path, phase: str) -> dict[str, InputBinding]:
+    """Reject ambiguous input sources before any external work starts."""
+    inputs: dict[str, InputBinding] = {}
+    modes = {"input_file", "input_folder", "output", "request", "literal"}
+    for name, value in _mapping(raw, path, f"{phase}.inputs").items():
+        label = f"{phase}.inputs.{name}"
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) or not isinstance(value, dict):
+            raise ManifestError(f"{path}: {label} must be a named binding mapping")
+        unknown = set(value) - modes - {"data_selection", "pointer", "expected_type"}
+        if unknown:
+            raise ManifestError(f"{path}: {label} has unknown fields: {sorted(unknown)}")
+        selected = set(value) & modes
+        if selected == {"input_file", "input_folder"}:
+            selected = {"input_file"}
+        if len(selected) != 1:
+            raise ManifestError(f"{path}: {label} must declare exactly one input mode")
+        mode = selected.pop()
+        source = value[mode]
+        if mode != "literal" and (not isinstance(source, str) or not source.strip()):
+            raise ManifestError(f"{path}: {label}.{mode} must be a nonempty string")
+        selection = value.get("data_selection", "")
+        if not isinstance(selection, str):
+            raise ManifestError(f"{path}: {label}.data_selection must be text")
+        if mode == "input_folder" and not selection.strip():
+            raise ManifestError(f"{path}: {label} requires data_selection")
+        if mode != "input_folder" and "data_selection" in value:
+            raise ManifestError(f"{path}: {label}.data_selection requires folder selection")
+        folder = value.get("input_folder") if mode == "input_file" else None
+        if folder is not None and (not isinstance(folder, str) or not folder.strip()):
+            raise ManifestError(f"{path}: {label}.input_folder must be a nonempty string")
+        inputs[name] = InputBinding(mode, source, folder, selection, **_binding_options(value, path, label))
+    return inputs
+
+
+def _parse_outputs(raw: Any, path: Path, phase: str) -> dict[str, OutputBinding]:
+    """Parse projections from the validated phase result."""
+    outputs: dict[str, OutputBinding] = {}
+    for name, value in _mapping(raw, path, f"{phase}.outputs").items():
+        label = f"{phase}.outputs.{name}"
+        if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) or not isinstance(value, dict):
+            raise ManifestError(f"{path}: {label} must be a named projection mapping")
+        if set(value) - {"pointer", "expected_type"}:
+            raise ManifestError(f"{path}: {label} has unknown projection fields")
+        outputs[name] = OutputBinding(**_binding_options(value, path, label))
+    return outputs
 
 
 def _validate(workflow: Workflow, extensions: PhaseExtensionRegistry) -> None:
@@ -408,6 +472,18 @@ def _validate(workflow: Workflow, extensions: PhaseExtensionRegistry) -> None:
         raise ManifestError(f"{path}: no phases defined")
 
     known: set[str] = set()
+    output_names: set[str] = set()
+    for phase in [node for top in workflow.phases for node in [top, *top.body]]:
+        if (phase.inputs or phase.outputs) and phase.kind not in {"role", "workflow"} and extensions.get(phase.kind) is None:
+            raise ManifestError(f"{path}: phase '{phase.name}' cannot bind inputs or outputs")
+        duplicate = output_names & set(phase.outputs)
+        if duplicate:
+            raise ManifestError(f"{path}: duplicate named outputs: {sorted(duplicate)}")
+        output_names.update(phase.outputs)
+    for phase in [node for top in workflow.phases for node in [top, *top.body]]:
+        for binding in phase.inputs.values():
+            if binding.mode == "output" and binding.source not in output_names:
+                raise ManifestError(f"{path}: unknown named output: {binding.source}")
     for phase in workflow.phases:
         if phase.name in known:
             raise ManifestError(f"{path}: duplicate phase name '{phase.name}'")

@@ -82,6 +82,8 @@ class JournalEntry:
     result: dict[str, Any] | None = None
     trace_path: str | None = None
     session_ref: str | None = None
+    input_evidence: dict[str, Any] = field(default_factory=dict)
+    named_outputs: dict[str, Any] = field(default_factory=dict)
     timestamp: str = field(default_factory=utc_now)
 
     def to_dict(self) -> dict[str, Any]:
@@ -256,6 +258,26 @@ class ForeachConfig:
     stop_when: str = ""
 
 
+@dataclass(frozen=True)
+class InputBinding:
+    """One explicit source with an optional pointer and result type."""
+
+    mode: str
+    source: Any
+    input_folder: str | None = None
+    data_selection: str = ""
+    pointer: str = ""
+    expected_type: str | None = None
+
+
+@dataclass(frozen=True)
+class OutputBinding:
+    """A named projection from one validated producer result."""
+
+    pointer: str = ""
+    expected_type: str | None = None
+
+
 @dataclass
 class PhaseConfig:
     name: str
@@ -307,6 +329,8 @@ class PhaseConfig:
     limits: ChildLimitsConfig | None = None
     child_result: ChildResultConfig | None = None
     foreach: ForeachConfig | None = None
+    inputs: dict[str, InputBinding] = field(default_factory=dict)
+    outputs: dict[str, OutputBinding] = field(default_factory=dict)
 
     # Data owned by an optional phase-kind extension. Built-in phases leave
     # this empty.

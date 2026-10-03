@@ -28,9 +28,19 @@ from .protocol import (
     WorkflowResolution,
 )
 from .python_role import RoleContext
+from .inputs import FileMetadata, FolderListing, InputCapture, InputError, InputResolver, InputScope
+from .protocol import InputBinding, OutputBinding
 
 __all__ = [
     "AgentResult",
+    "FileMetadata",
+    "FolderListing",
+    "InputBinding",
+    "InputCapture",
+    "InputError",
+    "InputResolver",
+    "InputScope",
+    "OutputBinding",
     "ClaudeDriver",
     "CodexDriver",
     "GateResult",
