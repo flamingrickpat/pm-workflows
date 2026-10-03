@@ -1,5 +1,10 @@
 # pm-workflows
 
+Version 0.5.1 pins pm-coder 0.10.0 with its optional `pm_decision` Python client.
+Workflow execution keeps its existing LLM driver.
+No classification phase or automatic Laya route is active in this release.
+The [decision client manual](https://github.com/flamingrickpat/pm-coder/blob/ac8327baf669dad54ea9f91580f2bed1023825b4/docs/index.md) describes its independent API and limits.
+
 `pm-workflows` is the reusable workflow kernel. It loads a workflow manifest,
 dispatches isolated role sessions, runs declared checks, routes declared
 outcomes, journals attempts, and manages git checkpoints.
