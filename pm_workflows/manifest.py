@@ -22,6 +22,7 @@ from .protocol import (
     ChildResultConfig,
     ChildTaskConfig,
     ChildWorkspaceConfig,
+    ClassificationConfig,
     ForeachConfig,
     InputBinding,
     OutputBinding,
@@ -35,7 +36,7 @@ from .protocol import (
 
 # Iterator sources the kernel knows how to enumerate.
 ITERATOR_SOURCES = frozenset({"pending_work_items"})
-BUILTIN_PHASE_KINDS = frozenset({"role", "gate", "script", "loop", "human", "workflow"})
+BUILTIN_PHASE_KINDS = frozenset({"role", "gate", "script", "loop", "human", "workflow", "classify"})
 VAR_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_.]*)\}")
 
 
@@ -363,6 +364,7 @@ def _parse_phase(
 
     child_fields = _parse_child_fields(raw, path, name)
     kind = str(raw.get("kind", "role"))
+    classification, on_class, fallback_for, classify_inputs = _parse_classification(raw, path, name, kind)
     extension = extensions.get(kind)
     extension_data: dict[str, Any] = {}
     if extension is not None and extension.parse is not None:
@@ -399,10 +401,59 @@ def _parse_phase(
         workflow=raw.get("workflow"),
         allowed_roles=raw.get("allowed_roles", []) or [],
         extension=extension_data,
-        inputs=_parse_inputs(raw.get("inputs"), path, name),
+        inputs=classify_inputs if kind == "classify" else _parse_inputs(raw.get("inputs"), path, name),
         outputs=_parse_outputs(raw.get("outputs"), path, name),
+        classification=classification, on_class=on_class, fallback_for=fallback_for,
         **child_fields,
     )
+
+
+def _parse_classification(raw: dict[str, Any], path: Path, name: str, kind: str) -> tuple[ClassificationConfig | None, dict[str, str], str, dict[str, InputBinding]]:
+    """Parse one primary classifier or its dedicated recovery node."""
+    if kind != "classify":
+        return None, {}, "", {}
+    fallback = raw.get("fallback_for", "")
+    routes = raw.get("on_class")
+    if not isinstance(fallback, str) or not isinstance(routes, dict) or not routes:
+        raise ManifestError(f"{path}: {name} requires on_class and a text fallback_for")
+    if any(not isinstance(k, str) or not k or not isinstance(v, str) or not v for k, v in routes.items()):
+        raise ManifestError(f"{path}: {name}.on_class requires nonempty labels and destinations")
+    conflicting = {"on_status", "on_invalid", "on_failure", "next", "attempt_auto_repair"} & set(raw)
+    if conflicting:
+        raise ManifestError(f"{path}: {name} must use on_class, without {sorted(conflicting)}")
+    source_keys = {"input_file", "input_folder", "data_selection", "output", "request", "literal", "pointer", "expected_type"}
+    if fallback:
+        if set(raw) & (source_keys | {"inputs", "instruction", "result_contract", "backend", "connection", "classification_limits"}):
+            raise ManifestError(f"{path}: {name} inherits its classification contract and inputs")
+        return None, dict(routes), fallback, {}
+    if raw.get("backend", "llm") != "llm":
+        raise ManifestError(f"{path}: {name}.backend supports llm only; optional Laya is not enabled")
+    question = raw.get("instruction")
+    contract = raw.get("result_contract")
+    if not isinstance(question, str) or not question.strip() or not isinstance(contract, dict) or contract.get("type") != "classes":
+        raise ManifestError(f"{path}: {name} requires instruction and result_contract.type: classes")
+    classes = contract.get("enum")
+    if set(contract) != {"type", "enum"} or not isinstance(classes, dict) or not classes:
+        raise ManifestError(f"{path}: {name} requires a nonempty class description mapping")
+    if any(not isinstance(k, str) or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", k) or not isinstance(v, str) or not v.strip() for k, v in classes.items()) or "INVALID" in classes:
+        raise ManifestError(f"{path}: {name} requires described labels; INVALID is implicit")
+    limits = _mapping(raw.get("classification_limits"), path, f"{name}.classification_limits")
+    allowed = {"max_input_tokens", "max_output_tokens", "max_capture_bytes", "max_candidates", "fallback_max_bytes", "timeout_seconds"}
+    if set(limits) - allowed:
+        raise ManifestError(f"{path}: {name} has unknown classification limits")
+    for key, value in limits.items():
+        valid = type(value) in {int, float} if key == "timeout_seconds" else type(value) is int
+        if not valid or not 0 < value < float("inf"):
+            raise ManifestError(f"{path}: {name}.{key} must be positive and finite")
+    connection = raw.get("connection", "Default")
+    if not isinstance(connection, str) or not connection.strip():
+        raise ManifestError(f"{path}: {name}.connection must name a connection")
+    if "inputs" in raw and set(raw) & source_keys:
+        raise ManifestError(f"{path}: {name} declares contradictory input modes")
+    bindings = _parse_inputs(raw.get("inputs") if "inputs" in raw else {"evidence": {k: raw[k] for k in source_keys if k in raw}}, path, name)
+    if len(bindings) != 1:
+        raise ManifestError(f"{path}: {name} requires exactly one evidence binding")
+    return ClassificationConfig(question.strip(), dict(classes), connection, **limits), dict(routes), "", bindings
 
 
 def _binding_options(raw: dict[str, Any], path: Path, label: str) -> dict[str, Any]:
@@ -474,7 +525,7 @@ def _validate(workflow: Workflow, extensions: PhaseExtensionRegistry) -> None:
     known: set[str] = set()
     output_names: set[str] = set()
     for phase in [node for top in workflow.phases for node in [top, *top.body]]:
-        if (phase.inputs or phase.outputs) and phase.kind not in {"role", "workflow"} and extensions.get(phase.kind) is None:
+        if (phase.inputs or phase.outputs) and phase.kind not in {"role", "workflow", "classify"} and extensions.get(phase.kind) is None:
             raise ManifestError(f"{path}: phase '{phase.name}' cannot bind inputs or outputs")
         duplicate = output_names & set(phase.outputs)
         if duplicate:
@@ -577,6 +628,9 @@ def _validate(workflow: Workflow, extensions: PhaseExtensionRegistry) -> None:
                     f"{path}: role phase '{phase.name}' must declare on_invalid "
                     "for contract violations"
                 )
+
+        if phase.kind == "classify":
+            _validate_classification(phase, workflow)
 
         if phase.kind == "gate":
             if not phase.predicate:
@@ -728,6 +782,41 @@ def _validate(workflow: Workflow, extensions: PhaseExtensionRegistry) -> None:
             raise ManifestError(f"{path}: role '{name}' names no skill")
 
     _check_reachable(workflow, known)
+
+
+def _validate_classification(phase: PhaseConfig, workflow: Workflow) -> None:
+    """Require a scoped handler, complete routes, and a terminal invalid path."""
+    source = workflow.phase_by_name(phase.fallback_for) if phase.fallback_for else phase
+    if source is None or source.kind != "classify" or source.fallback_for or source.classification is None:
+        raise ManifestError(f"{workflow.path}: {phase.name} names no primary classifier")
+    labels = set(source.classification.classes) | {"INVALID"}
+    if set(phase.on_class) != labels:
+        raise ManifestError(f"{workflow.path}: {phase.name}.on_class must route exactly {sorted(labels)}")
+    if phase.fallback_for:
+        role = workflow.roles.get(phase.role or "")
+        if role is None or role.skill.endswith(".py") or role.mcp or role.writable_paths:
+            raise ManifestError(f"{workflow.path}: {phase.name} requires a read-only coding role without MCP")
+        if source.on_class["INVALID"] != phase.name or workflow.loop_containing(source.name) != workflow.loop_containing(phase.name):
+            raise ManifestError(f"{workflow.path}: {phase.name} must handle its source in the same loop scope")
+        if any(phase.on_class[k] != source.on_class[k] for k in source.classification.classes):
+            raise ManifestError(f"{workflow.path}: {phase.name} must retain its source's class routes")
+        # An unresolved recovery can wait or stop. It cannot reach inference again.
+        frontier = [phase.on_class["INVALID"]]
+        seen: set[str] = set()
+        while frontier:
+            name = frontier.pop()
+            if name in {phase.name, source.name}:
+                raise ManifestError(f"{workflow.path}: {phase.name} has a recursive INVALID route")
+            if name in seen or name in RESERVED_ROUTES:
+                continue
+            seen.add(name)
+            node = workflow.phase_by_name(name)
+            if node is not None:
+                frontier.extend(node.route_targets())
+    else:
+        handler = workflow.phase_by_name(phase.on_class["INVALID"])
+        if handler is None or handler.kind != "classify" or handler.fallback_for != phase.name:
+            raise ManifestError(f"{workflow.path}: {phase.name}.INVALID requires its dedicated fallback_for handler")
 
 
 def _check_reachable(workflow: Workflow, known: set[str]) -> None:

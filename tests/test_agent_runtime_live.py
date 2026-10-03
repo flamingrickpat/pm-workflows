@@ -100,3 +100,19 @@ def test_cancellation_during_actual_inference(tmp_path):
         finally:
             stop.set()
     assert list(logs.glob("*/turn_*_agent_*.json"))
+
+
+def test_bound_session_deadline_cancels_actual_inference(tmp_path):
+    runtime = WorkflowRuntime(BoundEnvironment(AgentTarget(tmp_path)), threading.Event(), {}, agent_model=AgentModel(
+        base_url=os.environ.get("LOCAL_AGENT_BASE_URL", "http://127.0.0.1:8080/v1"),
+        model=os.environ.get("LOCAL_AGENT_MODEL", "qwen"),
+        api_key=os.environ.get("LOCAL_AGENT_API_KEY", "local"),
+        context_window=96000, live_test=True,
+    ))
+    started = time.monotonic()
+    with pytest.raises(TimeoutError, match="session deadline"):
+        PmCoderDriver(log_root=tmp_path / "logs", timeout_seconds=0.05).run_session(
+            "deadline", 1, "", "Write a detailed essay about every integer from 1 to 1000. Do not use tools.",
+            tmp_path, runtime=runtime)
+    assert time.monotonic() - started < 10
+    assert not runtime.stop_event.is_set()

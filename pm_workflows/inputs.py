@@ -261,7 +261,9 @@ class InputResolver:
         if expected is not None and before != expected:
             raise InputError("stale_input", f"{path} changed after listing")
         if before.size_bytes > self.max_bytes:
-            raise InputError("oversized_input", f"{path} exceeds {self.max_bytes} bytes")
+            exc = InputError("oversized_input", f"{path} exceeds {self.max_bytes} bytes")
+            exc.evidence = {"file": before.to_dict(), "scope": asdict(self.scope)}
+            raise exc
         try:
             text = self.environment.read_text(path)
         except (FileNotFoundError, KeyError) as exc:

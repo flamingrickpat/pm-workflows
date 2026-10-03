@@ -38,7 +38,7 @@ from .protocol import RESERVED_ROUTES, ROUTE_EXIT_LOOP, ROUTE_NEXT_ITEM, ROUTE_S
 
 TERMINAL_SUCCESS = "<success>"
 TERMINAL_STOP = "<stop>"
-DISPATCH_KINDS = frozenset({"role", "gate", "script", "human", "workflow"})
+DISPATCH_KINDS = frozenset({"role", "gate", "script", "human", "workflow", "classify"})
 
 
 # --------------------------------------------------------------------- files
@@ -248,7 +248,12 @@ def build_graph(workflow: Workflow) -> dict[str, PhaseNode]:
             name=phase.name, kind=phase.kind,
             loop=enclosing_loop.name if enclosing_loop else None,
         )
-        if phase.kind == "role":
+        if phase.kind == "classify":
+            for label, target in phase.on_class.items():
+                node.edges.append(Edge(label, _normalize_target(target, enclosing_loop), "advance", None,
+                                       "scoped agent recovery" if label == "INVALID" and not phase.fallback_for else ""))
+            node.backstop_limit = backstop_for(enclosing_loop)
+        elif phase.kind == "role":
             role = workflow.roles[phase.role or ""]
             declared = role.result_contract.status_values
             if declared:
@@ -630,8 +635,8 @@ def simulate(
                     current = target_edge.target
                 continue
 
-            advance = [e for e in node.edges if e.edge_kind == "advance"]
-            invalid = next((e for e in node.edges if e.outcome == "invalid"), None)
+            advance = [e for e in node.edges if e.edge_kind == "advance" and e.outcome not in {"invalid", "INVALID"}]
+            invalid = next((e for e in node.edges if e.outcome in {"invalid", "INVALID"}), None)
             chosen: Edge
             if node.kind in {"gate", "script"}:
                 pass_edge = next(e for e in advance if e.outcome == "pass")

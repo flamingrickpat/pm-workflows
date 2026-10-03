@@ -49,6 +49,9 @@ class WorkflowRuntime:
     # Opens the runtime for one child invocation. ``None`` reuses this runtime
     # so existing embedders keep their single-environment behavior.
     child_factory: Callable[[str], "WorkflowRuntime"] | None = None
+    # Classification connections are explicit and independent of the agent.
+    # An absent name produces INVALID. Existing roles need no new connection.
+    classification_models: Mapping[str, AgentModel] = field(default_factory=dict)
 
     def check_cancelled(self) -> None:
         if self.stop_event.is_set():

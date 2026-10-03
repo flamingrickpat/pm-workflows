@@ -8,9 +8,8 @@ nothing else:
   * it routes on the outcome the workflow declared for that check or status,
   * it appends every attempt to a journal the agents cannot see.
 
-There is no heuristic reading of agent prose, no classifier, and no forward
-repair. A failed phase reverts the repo to the last accepted commit and the
-same role is dispatched again with the failure as feedback.
+Classification uses explicit evidence and declared classes. Recovery runs in
+a scoped agent session. Retry state follows the manifest's state policy.
 """
 from __future__ import annotations
 
@@ -614,7 +613,7 @@ class Kernel:
         would be credited to a session that did not write them.
         """
         phase = self._resume_point(announce=False)
-        return phase is None or phase.kind not in {"gate", "script"}
+        return phase is None or phase.kind not in {"gate", "script", "classify"}
 
     def _over_phase_budget(self, phase: PhaseConfig) -> bool:
         """Backstop against a routing cycle nobody declared a cap for.
@@ -737,6 +736,7 @@ class Kernel:
             "human": self._execute_human,
             "loop": self._execute_loop,
             "workflow": self._execute_workflow,
+            "classify": self._execute_classify,
         }
         try:
             executor = executors[phase.kind]
@@ -745,6 +745,11 @@ class Kernel:
                 f"unsupported phase kind '{phase.kind}' in '{phase.name}'"
             ) from exc
         return executor(phase)
+
+    def _execute_classify(self, phase: PhaseConfig) -> dict[str, Any]:
+        """Record a bounded classification or one scoped recovery attempt."""
+        from .classification import execute_classification
+        return execute_classification(self, phase)
 
     def _execute_extension(
         self,
@@ -1809,7 +1814,7 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
         return InputResolver(environment, InputScope(self.task_id, self.run_id, item if item is not None else self.current_item or self.invocation_item),
                              request=self.request_data, entries=entries + child_inputs + self._active_child_inputs)
 
-    def capture_inputs(self, phase: PhaseConfig, variables: dict[str, Any] | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
+    def capture_inputs(self, phase: PhaseConfig, variables: dict[str, Any] | None = None, *, max_bytes: int | None = None, max_candidates: int | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
         """Capture a phase's explicit bindings for a role or phase extension.
 
         The returned receipts include full values, digests, and producer identity.
@@ -1817,12 +1822,20 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
         Cancellation propagates before or after each capture without a retry.
         """
         resolver = self._input_resolver()
+        if max_bytes is not None:
+            resolver.max_bytes = max_bytes
+        if max_candidates is not None:
+            resolver.max_candidates = max_candidates
         if phase.foreach is not None and variables:
             stable_field = phase.foreach.stable_id.removeprefix(phase.foreach.item + ".")
             item_id = str(dotted(variables[phase.foreach.item], stable_field))
             resolver.scope = replace(resolver.scope, item=f"{resolver.scope.item or ''}/{phase.name}/{item_id}")
         if phase.kind == "role":
             role = self.manifest.roles[phase.role or ""]
+            resolver.environment = GrantedInputEnvironment(resolver.environment, role.readable_paths, role.deny_access)
+        elif phase.kind == "classify" and phase.classification is not None:
+            handler = self.manifest.phase_by_name(phase.on_class["INVALID"])
+            role = self.manifest.roles[handler.role or ""]
             resolver.environment = GrantedInputEnvironment(resolver.environment, role.readable_paths, role.deny_access)
         values: dict[str, Any] = {}
         evidence: dict[str, Any] = {}
@@ -1855,6 +1868,7 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
                 raise
             values[name], evidence[name] = capture.value, capture.evidence
             evidence[name]["binding"] = asdict(binding)
+            evidence[name]["resolved_binding"] = asdict(replace(binding, source=source, input_folder=folder))
             evidence[name]["binding_sha256"] = digest(asdict(binding))
             evidence[name]["path_dependencies"] = dependencies
             if self.runtime is not None:
@@ -2235,6 +2249,8 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
         )
 
     def _route(self, phase: PhaseConfig, result: dict[str, Any]) -> str | None:
+        if phase.kind == "classify":
+            return phase.on_class[result["status"]]
         if (
             self.phase_extensions.get(phase.kind) is not None
             and phase.kind not in {"role", "gate", "script", "loop", "human", "workflow"}
@@ -2565,7 +2581,7 @@ Finish with exactly one line: FIXED, or RERUN. Put the report above it.
         if not route or route.get("verdict") != phase.name:
             return False
         preceding = self.manifest.phase_by_name(str(route.get("phase") or ""))
-        return preceding is not None and preceding.kind in {"gate", "script"}
+        return preceding is not None and preceding.kind in {"gate", "script", "classify"}
 
     def _park(self, phase_name: str, attempt: int, item: str | None = None) -> str:
         """Give up on a phase without either keeping or losing the rejected work.

@@ -30,9 +30,12 @@ from .protocol import (
 from .python_role import RoleContext
 from .inputs import FileMetadata, FolderListing, InputCapture, InputError, InputResolver, InputScope
 from .protocol import InputBinding, OutputBinding
+from .protocol import ClassificationConfig
+from .classification import replay_classification
 
 __all__ = [
     "AgentResult",
+    "ClassificationConfig",
     "FileMetadata",
     "FolderListing",
     "InputBinding",
@@ -64,4 +67,5 @@ __all__ = [
     "WorkflowResolution",
     "build_driver",
     "parse_workflow",
+    "replay_classification",
 ]

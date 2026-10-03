@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 import traceback
 from pathlib import Path
 from typing import Any
@@ -100,6 +101,7 @@ class PmCoderDriver:
                     runtime, target, prompt, skill, f"{run_id}_{attempt}",
                     self.log_root or (trace_file.parent.parent / "pm-coder" if trace_file else work_dir / "pm-coder"),
                     Path(mcp_config) if mcp_config is not None else None,
+                    self.timeout_seconds,
                 ))
             else:
                 payload = run_auto(
@@ -202,11 +204,13 @@ def _is_provider_exhaustion(exc: BaseException) -> bool:
 MinimalAgentDriver = PmCoderDriver
 
 
-async def _run_bound_agent(runtime, target, prompt, skill, run_id, log_root, mcp_config):
+async def _run_bound_agent(runtime, target, prompt, skill, run_id, log_root, mcp_config, timeout_seconds=7200):
     """Cancel supported asynchronous I/O and await session cleanup before return.
 
     Synchronous tool effects remain cooperative and cannot be undone.
     Explicit settings prevent endpoint discovery from blocking cancellation.
+    The session deadline cancels inference and awaits cleanup without setting
+    the caller's shared cancellation signal.
     """
     connection = runtime.agent_model
     if skill:
@@ -223,9 +227,12 @@ async def _run_bound_agent(runtime, target, prompt, skill, run_id, log_root, mcp
         else async_run_auto_with_bash_machine(prompt, target.bash_machine, user=target.user, **kwargs)
     )
     task = asyncio.create_task(call)
+    deadline = time.monotonic() + timeout_seconds
     try:
         while not task.done():
             runtime.check_cancelled()
+            if time.monotonic() >= deadline:
+                raise TimeoutError("The bound agent exceeded its session deadline.")
             await asyncio.wait({task}, timeout=0.05)
         runtime.check_cancelled()
         return task.result().as_dict()

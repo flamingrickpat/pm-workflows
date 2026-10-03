@@ -1,10 +1,11 @@
 # pm-workflows
 
 See [scoped input bindings](docs/input-bindings.md) for file versions, folder metadata, request fields, and named outputs.
+See [classification and INVALID recovery](docs/classification.md) for the optional `kind: classify` node.
 
-Version 0.5.1 pins pm-coder 0.10.0 with its optional `pm_decision` Python client.
+Version 0.7.0 pins pm-coder 0.10.0 with its optional `pm_decision` Python client.
 Workflow execution keeps its existing LLM driver.
-No classification phase or automatic Laya route is active in this release.
+Classification uses an explicitly supplied LLM connection. Automatic Laya routing remains disabled.
 The [decision client manual](https://github.com/flamingrickpat/pm-coder/blob/ac8327baf669dad54ea9f91580f2bed1023825b4/docs/index.md) describes its independent API and limits.
 
 `pm-workflows` is the reusable workflow kernel. It loads a workflow manifest,

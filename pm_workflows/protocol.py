@@ -279,6 +279,25 @@ class OutputBinding:
 
 
 @dataclass
+class ClassificationConfig:
+    """A finite question with explicit evidence and context limits.
+
+    Prompt limits use UTF-8 bytes as a conservative token bound. Capture and
+    recovery limits use bytes. No limit silently clips evidence.
+    """
+
+    instruction: str = ""
+    classes: dict[str, str] = field(default_factory=dict)
+    connection: str = "Default"
+    max_input_tokens: int = 16_384
+    max_output_tokens: int = 512
+    max_capture_bytes: int = 1_048_576
+    max_candidates: int = 256
+    fallback_max_bytes: int = 16_777_216
+    timeout_seconds: float = 120.0
+
+
+@dataclass
 class PhaseConfig:
     name: str
     kind: str  # role | script | gate | loop | human | workflow
@@ -331,6 +350,9 @@ class PhaseConfig:
     foreach: ForeachConfig | None = None
     inputs: dict[str, InputBinding] = field(default_factory=dict)
     outputs: dict[str, OutputBinding] = field(default_factory=dict)
+    classification: ClassificationConfig | None = None
+    on_class: dict[str, str] = field(default_factory=dict)
+    fallback_for: str = ""
 
     # Data owned by an optional phase-kind extension. Built-in phases leave
     # this empty.
@@ -345,6 +367,7 @@ class PhaseConfig:
     def route_targets(self) -> list[str]:
         """Every phase name this phase can route to, for load-time validation."""
         targets: list[str] = []
+        targets.extend(self.on_class.values())
         for value in (self.next, self.on_pass, self.exit):
             if isinstance(value, str) and value:
                 targets.append(value)
