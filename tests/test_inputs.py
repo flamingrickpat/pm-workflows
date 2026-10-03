@@ -203,6 +203,20 @@ def test_mutation_of_consumer_values_cannot_change_captured_evidence():
     assert capture.evidence["value_sha256"] == digest({"nested": [1]})
 
 
+def test_producer_metadata_changes_cannot_rewrite_a_captured_listing():
+    class ProducerEnvironment(MemoryEnvironment):
+        producer = {"task_id": "task", "run_id": "run", "item": None, "attempt": 1}
+        def file_metadata(self, path):
+            return replace(super().file_metadata(path), producer=self.producer)
+    environment = ProducerEnvironment({"logs/a": "same content"})
+    resolver = InputResolver(environment, SCOPE)
+    listing = resolver.list_folder("logs")
+    environment.producer["attempt"] = 2
+    assert listing.candidates[0].producer["attempt"] == 1
+    with pytest.raises(InputError, match="stale_input"):
+        resolver.capture_selected(listing, listing.candidates[0].candidate_id)
+
+
 def test_named_output_attempt_digest_and_loop_scope():
     producer = InputResolver(MemoryEnvironment(), replace(SCOPE, item="first"))
     outputs = producer.project_outputs({"report": OutputBinding("/data", "object")}, {"data": {"path": "logs/current"}}, phase="produce", attempt=2, revision="rev")

@@ -185,7 +185,9 @@ def metadata(environment: Any, path: str) -> FileMetadata:
             or (result.producer is not None and not isinstance(result.producer, dict))):
         raise InputError("malformed_value", f"invalid environment metadata fields for {path}")
     canonical(result.to_dict())
-    return result
+    # A native producer mapping can change after listing. Keep the captured
+    # metadata independent so the next version check can detect that change.
+    return deepcopy(result)
 
 
 class InputResolver:
@@ -303,7 +305,7 @@ class InputResolver:
                 raise InputError("stale_output", f"{name!r} belongs to another invocation or loop item")
             if digest(record.get("value")) != record.get("value_sha256"):
                 raise InputError("stale_output", f"{name!r} digest does not match its value")
-            return InputCapture(record["value"], {"schema": "pm.input-capture.v1", "mode": "output", **record})
+            return InputCapture(deepcopy(record["value"]), {"schema": "pm.input-capture.v1", "mode": "output", **deepcopy(record)})
         raise InputError("missing_output", name)
 
     def resolve(self, binding: InputBinding) -> InputCapture:
