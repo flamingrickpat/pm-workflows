@@ -3,7 +3,7 @@
 See [scoped input bindings](docs/input-bindings.md) for file versions, folder metadata, request fields, and named outputs.
 See [classification and INVALID recovery](docs/classification.md) for the optional `kind: classify` node.
 
-Version 0.7.0 pins pm-coder 0.10.0 with its optional `pm_decision` Python client.
+Version 0.7.1 pins pm-coder 0.10.0 with its optional `pm_decision` Python client.
 Workflow execution keeps its existing LLM driver.
 Classification uses an explicitly supplied LLM connection. Automatic Laya routing remains disabled.
 The [decision client manual](https://github.com/flamingrickpat/pm-coder/blob/ac8327baf669dad54ea9f91580f2bed1023825b4/docs/index.md) describes its independent API and limits.
@@ -264,7 +264,8 @@ hooks are not implemented. `context.include` and `context.exclude` are recorded
 and placed in the child request, but they are not a filesystem ACL.
 `allow_effects` is recorded in receipts but cannot be enforced until effect
 adapters expose typed capability IDs.
-# Application classification sessions
+
+## Application classification sessions
 
 `WorkflowRuntime.classification_session` can supply a lazy model session.
 The callback receives the connection name, recovery flag, and cancellation event.
