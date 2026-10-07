@@ -5,6 +5,8 @@ See [classification and INVALID recovery](docs/classification.md) for the option
 
 Version 0.7.1 pins pm-coder 0.10.0 with its optional `pm_decision` Python client.
 Workflow execution keeps its existing LLM driver.
+Native MCP configuration retains each server's `requestTimeoutMs` value.
+The [timeout contract](https://github.com/flamingrickpat/pm-coder/blob/061170544037d323c376acac8d7c241ffacf2685/docs/mcp-timeouts.md) describes units, validation, and external effects.
 Classification uses an explicitly supplied LLM connection. Automatic Laya routing remains disabled.
 The [decision client manual](https://github.com/flamingrickpat/pm-coder/blob/ac8327baf669dad54ea9f91580f2bed1023825b4/docs/index.md) describes its independent API and limits.
 

@@ -1428,7 +1428,7 @@ wheels = [
 [[package]]
 name = "pm-coder"
 version = "0.10.0"
-source = { git = "https://github.com/flamingrickpat/pm-coder.git?rev=ac8327baf669dad54ea9f91580f2bed1023825b4#ac8327baf669dad54ea9f91580f2bed1023825b4" }
+source = { git = "https://github.com/flamingrickpat/pm-coder.git?rev=061170544037d323c376acac8d7c241ffacf2685#061170544037d323c376acac8d7c241ffacf2685" }
 dependencies = [
     { name = "httpx" },
     { name = "just-bash" },
@@ -1439,7 +1439,7 @@ dependencies = [
 
 [[package]]
 name = "pm-workflows"
-version = "0.7.0"
+version = "0.7.1"
 source = { editable = "." }
 dependencies = [
     { name = "httpx" },
@@ -1456,7 +1456,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "httpx", specifier = ">=0.27,<1" },
-    { name = "pm-coder", git = "https://github.com/flamingrickpat/pm-coder.git?rev=ac8327baf669dad54ea9f91580f2bed1023825b4" },
+    { name = "pm-coder", git = "https://github.com/flamingrickpat/pm-coder.git?rev=061170544037d323c376acac8d7c241ffacf2685" },
     { name = "pydantic-ai-slim", extras = ["openai", "mcp"], specifier = "==2.27.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8,<10" },
     { name = "pyyaml", specifier = ">=6,<7" },
