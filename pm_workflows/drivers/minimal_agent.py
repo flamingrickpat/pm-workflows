@@ -7,7 +7,7 @@ import os
 import time
 import traceback
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from pm_coder import run_auto, async_run_auto, async_run_auto_with_bash_machine
 
@@ -76,7 +76,14 @@ class PmCoderDriver:
         trace_file: Path | None = None,
         mcp_config: Path | None = None,
         runtime: WorkflowRuntime | None = None,
+        images: Sequence[Sequence[Any]] = (),
     ) -> AgentResult:
+        """Run one session. ``images`` are ``(data, media_type)`` pairs sent with the prompt.
+
+        The session model sees those pictures in its first user turn. A model
+        without an image projector rejects the request, and the failure
+        propagates instead of dropping the image.
+        """
         if runtime is not None:
             runtime.check_cancelled()
             if runtime.agent_model is None:
@@ -94,6 +101,7 @@ class PmCoderDriver:
             "effort": self.effort,
             "skill": skill,
             "work_dir": str(work_dir),
+            "images": len(images),
         })
         try:
             if runtime is not None:
@@ -102,10 +110,12 @@ class PmCoderDriver:
                     self.log_root or (trace_file.parent.parent / "pm-coder" if trace_file else work_dir / "pm-coder"),
                     Path(mcp_config) if mcp_config is not None else None,
                     self.timeout_seconds,
+                    images,
                 ))
             else:
                 payload = run_auto(
                     prompt,
+                    images=images,
                     skill=skill or None,
                     cwd=work_dir,
                     run_id=f"{run_id}_{attempt}",
@@ -204,13 +214,15 @@ def _is_provider_exhaustion(exc: BaseException) -> bool:
 MinimalAgentDriver = PmCoderDriver
 
 
-async def _run_bound_agent(runtime, target, prompt, skill, run_id, log_root, mcp_config, timeout_seconds=7200):
+async def _run_bound_agent(runtime, target, prompt, skill, run_id, log_root, mcp_config, timeout_seconds=7200,
+                          images=()):
     """Cancel supported asynchronous I/O and await session cleanup before return.
 
     Synchronous tool effects remain cooperative and cannot be undone.
     Explicit settings prevent endpoint discovery from blocking cancellation.
     The session deadline cancels inference and awaits cleanup without setting
-    the caller's shared cancellation signal.
+    the caller's shared cancellation signal. ``images`` are ``(data,
+    media_type)`` pairs that ride on the first user turn of the session.
     """
     connection = runtime.agent_model
     if skill:
@@ -220,7 +232,7 @@ async def _run_bound_agent(runtime, target, prompt, skill, run_id, log_root, mcp
         base_url=connection.base_url, model=connection.model,
         api_key=connection.api_key, context_window=connection.context_window,
         enable_thinking=connection.enable_thinking, live_test=connection.live_test,
-        workspace_discovery=False, mcp_config=mcp_config,
+        workspace_discovery=False, mcp_config=mcp_config, images=list(images),
     )
     call = (
         async_run_auto(prompt, **kwargs) if target.bash_machine is None
